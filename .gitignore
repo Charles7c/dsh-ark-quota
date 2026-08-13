@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Harness-local state (never commit these — they hold live session cookies)
+.dsh/
+settings.yaml
+settings.*
+cordis.patch.yml
+cordis.patch.*
+!cordis.patch.yml.example
+cordis.yml
+*.local.yml
+*.local.yaml
+*.log
+
+# Local secrets / registry auth
+.env
+.env.*
+.npmrc
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

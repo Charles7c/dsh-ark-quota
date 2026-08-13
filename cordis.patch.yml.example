@@ -1,0 +1,15 @@
+# Example DSH profile patch entry for dsh-ark-quota.
+# Copy this into your profile's cordis.patch.yml, replacing the PASTE_*
+# placeholders with your OWN console.volcengine.com cookies.
+# NEVER commit real cookie values.
+- insert:
+    - id: ark-quota
+      name: dsh-ark-quota
+      config:
+        userInfo: 'PASTE_USERINFO_COOKIE'
+        digest: 'PASTE_DIGEST_COOKIE'
+        csrfToken: ''          # optional; auto-bootstrapped when stale
+        xWebId: 'U2FsdGVkX1/5PNdS+cQxIt+7URSEcJ59ZjjT3gwhknNgNz6mZhgxNfJq59t4lEaP'
+        region: cn-beijing
+        version: '2024-01-01'
+        refreshMs: 300000

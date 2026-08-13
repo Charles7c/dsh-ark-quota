@@ -1,0 +1,40 @@
+{
+  "name": "dsh-ark-quota",
+  "description": "火山方舟订阅套餐剩余额度侧边栏小组件：宿主半区代理控制台 GetCodingPlanUsage，浏览器半区渲染 footer 固定小组件",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.js",
+  "files": [
+    "lib",
+    "tools",
+    "cordis.patch.yml.example",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime"
+      ],
+      "platform": "web"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "0.1.0-rc.6",
+    "yaml": "^2.4.0"
+  },
+  "license": "MIT"
+}
