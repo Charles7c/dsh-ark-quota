@@ -1,5 +1,7 @@
 # dsh-ark-quota
 
+**English** · [简体中文](./README.zh-CN.md)
+
 A [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) (DSH) web plugin that shows your **火山方舟 (Volcano Ark) Coding Plan subscription quota** as a fixed widget in the sidebar footer — without ever leaving the DSH GUI.
 
 - Host half (`lib/index.js`) proxies the console API `GetCodingPlanUsage` behind a same-origin route (`/ark-quota`), because the console API does not allow CORS from the DSH origin.
@@ -95,7 +97,7 @@ All settings live in the `ark-quota` settings namespace. The composition entry c
 }
 ```
 
-On failure: `{ "ok": false, "code": "unauthorized" | "upstream" | "network", "message": "…" }`.
+On failure: `{ "ok": false, "code": "unauthorized" | "upstream" | "network", "message": "…" }` (HTTP 401 / 502 / 504 respectively).
 
 ## Security notes
 
