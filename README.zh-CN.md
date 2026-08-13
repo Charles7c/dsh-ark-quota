@@ -107,7 +107,7 @@
 
 ## 参与贡献
 
-欢迎贡献！开发流程、测试、安全要求与发版流程见 [CONTRIBUTING.zh-CN.md](./CONTRIBUTING.zh-CN.md)（English: [CONTRIBUTING.md](./CONTRIBUTING.md)）。
+欢迎贡献！参与方式、提交与 PR 规范、发版流程见 [CONTRIBUTING.zh-CN.md](./CONTRIBUTING.zh-CN.md)（English: [CONTRIBUTING.md](./CONTRIBUTING.md)）。AI agent 与深度开发者请先读 [AGENTS.md](./AGENTS.md)——它涵盖插件加载机制、编码约定、强制安全不变量与测试清单。
 
 ## 许可证
 
