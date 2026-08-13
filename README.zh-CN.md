@@ -105,6 +105,10 @@
 - Cookie 是 JWT 会话凭据，存放于 `$DSH_HOME` 下的 `cordis.patch.yml` / `settings.yaml`，**已被 git 排除**（见 `.gitignore`）。
 - `tools/refresh.mjs` 将 CDP 调试端口**仅绑定 127.0.0.1**，并使用操作系统临时目录下的临时浏览器配置，所有退出路径（成功 / 报错 / Ctrl+C）都会清理。**工具运行期间**（即你登录的过程中），本机其他进程可能连上该端口读取弹出浏览器中的会话 Cookie——请登录完让它自动结束即可；不要在共享机器上长时间挂起。
 
+## 参与贡献
+
+欢迎贡献！开发流程、测试、安全要求与发版流程见 [CONTRIBUTING.zh-CN.md](./CONTRIBUTING.zh-CN.md)（English: [CONTRIBUTING.md](./CONTRIBUTING.md)）。
+
 ## 许可证
 
 [MIT](./LICENSE)

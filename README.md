@@ -105,6 +105,10 @@ On failure: `{ "ok": false, "code": "unauthorized" | "upstream" | "network", "me
 - Cookies are JWT session credentials. They are stored in `cordis.patch.yml` / `settings.yaml` under `$DSH_HOME` and are **excluded from git** (see `.gitignore`).
 - `tools/refresh.mjs` binds the CDP debugging port to **127.0.0.1 only** and uses a throwaway browser profile under the OS temp dir which is removed on every exit path (success, error, Ctrl+C). **While the refresh tool is running** (i.e. during your login), any other local process could connect to that port and read the session cookies of the popped browser — so log in, let it finish, and close it; don't leave it running on a shared machine.
 
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](./CONTRIBUTING.md) for the development workflow, testing, security requirements, and release process (简体中文见 [CONTRIBUTING.zh-CN.md](./CONTRIBUTING.zh-CN.md)).
+
 ## License
 
 [MIT](./LICENSE)
