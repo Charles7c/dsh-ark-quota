@@ -33,7 +33,7 @@
     }
   },
   "dependencies": {
-    "@deepseek-ai/schemastery": "0.1.0-rc.6",
+    "@deepseek-ai/schemastery": "^3.18.1",
     "yaml": "^2.4.0"
   },
   "license": "MIT"
