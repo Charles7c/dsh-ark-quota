@@ -28,6 +28,10 @@ import { createServer } from "node:net";
 import YAML from "yaml";
 
 const EDGE_CANDIDATES = [
+  // macOS
+  "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  // Windows
   "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
   "C:/Program Files/Microsoft/Edge/Application/msedge.exe",
   "C:/Program Files/Google/Chrome/Application/chrome.exe",
@@ -159,7 +163,11 @@ async function main() {
     } catch { /* no browser up yet */ }
     // 2. Force-kill the browser tree (idempotent; harmless if already closed).
     if (proc && proc.pid) {
-      try { spawn("taskkill", ["/PID", String(proc.pid), "/T", "/F"], { stdio: "ignore" }); } catch { /* best effort */ }
+      const isWin = process.platform === "win32";
+      try {
+        spawn(isWin ? "taskkill" : "pkill", isWin ? ["/PID", String(proc.pid), "/T", "/F"] : ["-P", String(proc.pid)], { stdio: "ignore" });
+        if (!isWin) spawn("pkill", ["-f", "ark-quota-edge-"], { stdio: "ignore" });
+      } catch { /* best effort */ }
     }
     // 3. Drop the throwaway profile holding the live cookies.
     if (userDataDir) {

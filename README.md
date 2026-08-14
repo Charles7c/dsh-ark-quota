@@ -15,7 +15,7 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) (DSH) web 
 - Sidebar footer widget: wide card (session / weekly / monthly usage bars) on the footer action row, or a compact remaining-percent pill.
 - CSRF token auto-rotation: when the console answers `InvalidCSRFToken`, the proxy adopts the token from the `X-Need-Token` response header and retries once.
 - Live maintenance: cookies are read from the `ark-quota` settings namespace (`$DSH_HOME/settings.yaml`, hot-reloaded by `dsh-settings-file`). A change drops the cache immediately — **no server restart**.
-- One-click cookie refresh: `tools/refresh.mjs` opens Edge, you log in, it extracts and writes the cookies for you.
+- One-click cookie refresh: `tools/refresh.mjs` opens your installed Edge/Chrome (macOS & Windows), you log in, it extracts and writes the cookies for you.
 
 ## Requirements
 
@@ -24,7 +24,21 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) (DSH) web 
 
 ## Installation
 
-1. Add this package to your profile's workspace (`pnpm-workspace.yaml` under `$DSH_HOME/profiles/<profile>/`) — e.g. via a git dependency:
+1. Make the package resolvable from your profile. The loader resolves `name: dsh-ark-quota`
+   from the profile directory, so the package must physically live at
+   `$DSH_HOME/profiles/<profile>/node_modules/dsh-ark-quota` (Node's normal `node_modules` walk).
+   Get it there either by cloning straight into the module path:
+
+   ```sh
+   git clone https://github.com/lordqyxz/dsh-ark-quota \
+     "$DSH_HOME/profiles/<profile>/node_modules/dsh-ark-quota"
+   ```
+
+   or by installing it as a dependency of the profile, e.g.
+   `dsh plugin --profile <profile> add github:lordqyxz/dsh-ark-quota` (forwards to `pnpm add`).
+
+2. Add the package to your profile's workspace (`pnpm-workspace.yaml` under `$DSH_HOME/profiles/<profile>/`)
+   so pnpm treats the installed copy as a workspace member and links its dependencies:
 
    ```yaml
    packages:
@@ -32,7 +46,12 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) (DSH) web 
      - 'node_modules/dsh-ark-quota'
    ```
 
-2. Add an entry to your profile's `cordis.patch.yml`:
+   Then run `pnpm install` in the profile directory. If your harness already provides the
+   profile's dependencies (e.g. the `$DSH_HOME/profiles/node_modules` module fallback of an
+   `npx`-installed harness), `pnpm install` is optional — the package's deps
+   (`@deepseek-ai/schemastery`, `yaml`) already resolve, so placing the package is enough.
+
+3. Add an entry to your profile's `cordis.patch.yml`:
 
    ```yaml
    - insert:
@@ -47,7 +66,10 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) (DSH) web 
            refreshMs: 300000
    ```
 
-3. Restart the DSH server, refresh the browser. The widget appears at the bottom of the sidebar.
+4. Apply and verify. Editing `cordis.patch.yml` is hot-applied by DSH's HMR watcher on recent
+   versions (the host route and client boot graph recompose without a restart) — check it with
+   `curl -i http://127.0.0.1:3080/ark-quota`. If the route isn't live, restart the DSH server
+   and refresh the browser. The widget appears at the bottom of the sidebar.
 
 ## Getting the cookies
 
@@ -59,7 +81,7 @@ Open `https://console.volcengine.com/ark/region:cn-beijing/subscription/coding-p
 
 Only `userInfo` + `digest` are strictly required; the proxy recovers a stale or missing `csrfToken` automatically on first request.
 
-> 💡 **Easier**: run `node tools/refresh.mjs` — it pops Edge at the subscription page, you log in, and it extracts and writes all cookies into `$DSH_HOME/settings.yaml` automatically (no copy/paste, no restart).
+> 💡 **Easier**: run `node tools/refresh.mjs` — it pops your installed Edge/Chrome (macOS & Windows) at the subscription page, you log in, and it extracts and writes all cookies into `$DSH_HOME/settings.yaml` automatically (no copy/paste, no restart).
 
 ## Usage
 

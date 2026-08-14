@@ -21,7 +21,7 @@ hand-written bundle consumed by the DSH client module loader.
 
 ## Load mechanics (know before editing)
 
-- **Plugin-set changes (adding/removing the entry in `cordis.patch.yml`) require a server restart** — the client boot graph is built at startup by the Node half of `dsh-client-modules` (it scans enabled entries for `dsh.client` packages, resolves `exports["./client"]`, hashes and serves the bundle under `/plugins`).
+- **Plugin-set changes (adding/removing the entry in `cordis.patch.yml`) are hot-applied by DSH's HMR watcher on recent versions** — the profile's patch file is watched (`watchUserPatches`), so the composed tree, the host plugin, and the client boot graph (the Node half of `dsh-client-modules` re-scans entries for `dsh.client` packages, resolves `exports["./client"]`, hashes and serves the bundle under `/plugins`) all recompose without a restart. Verify with `curl -i http://127.0.0.1:3080/ark-quota`; if the route isn't live, restart the server and refresh the browser.
 - **Host half changes always require a server restart.** The host does not hot-reload file packages; the dynamic runner only sandboxes inline packages.
 - **Client bundle changes hot-reload only with a rebuild watcher**: the HMR chain (`dsh-client-hmr`, browser polls `GET /plugins/events`) stays idle unless `pnpm run dev:web` from a DSH source checkout rewrites the bundle. Without the watcher, editing `lib/client.js` + manual browser refresh is the loop. HMR reload is coarse: React state inside the reloaded plugin is lost.
 - The client bundle is lazy: executing the script only registers the factory; the factory body runs at materialization (`factory(require)` → `module.exports` with `apply` + `inject`).

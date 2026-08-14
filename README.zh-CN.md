@@ -15,7 +15,7 @@
 - **侧边栏固定小组件**：侧边栏底部操作区显示宽版卡片（会话 / 本周 / 本月三条用量进度），窄版显示本月剩余百分比胶囊。
 - **CSRF Token 自动轮换**：控制台返回 `InvalidCSRFToken` 时，代理自动读取响应头 `X-Need-Token` 中的新 token 并重试一次。
 - **免重启维护**：Cookie 从 `ark-quota` 设置命名空间读取（`$DSH_HOME/settings.yaml`，由 `dsh-settings-file` 热重载）。任何变更立即清空缓存——**无需重启服务**。
-- **一键刷新 Cookie**：`tools/refresh.mjs` 弹出 Edge 浏览器，你登录后自动提取并写入 Cookie。
+- **一键刷新 Cookie**：`tools/refresh.mjs` 弹出你已安装的 Edge/Chrome（macOS 与 Windows），你登录后自动提取并写入 Cookie。
 
 ## 环境要求
 
@@ -24,7 +24,18 @@
 
 ## 安装
 
-1. 将本包加入你 profile 的 workspace（`$DSH_HOME/profiles/<profile>/pnpm-workspace.yaml`），例如通过 git 依赖：
+1. 让本包从你的 profile 可被解析。加载器从 profile 目录解析 `name: dsh-ark-quota`，因此包必须**实体存在**于 `$DSH_HOME/profiles/<profile>/node_modules/dsh-ark-quota`（Node 常规的 `node_modules` 向上查找）。两种方式：
+
+   - 直接把仓库克隆进模块路径：
+
+     ```sh
+     git clone https://github.com/lordqyxz/dsh-ark-quota \
+       "$DSH_HOME/profiles/<profile>/node_modules/dsh-ark-quota"
+     ```
+
+   - 或将其作为 profile 的依赖安装，例如 `dsh plugin --profile <profile> add github:lordqyxz/dsh-ark-quota`（内部转发给 `pnpm add`）。
+
+2. 将本包加入你 profile 的 workspace（`$DSH_HOME/profiles/<profile>/pnpm-workspace.yaml`），让 pnpm 把已安装的副本视为 workspace 成员并链接其依赖：
 
    ```yaml
    packages:
@@ -32,7 +43,9 @@
      - 'node_modules/dsh-ark-quota'
    ```
 
-2. 在 profile 的 `cordis.patch.yml` 中加入条目：
+   随后在 profile 目录运行 `pnpm install`。如果你的 harness 已提供 profile 的依赖（例如 `npx` 安装方式的 `$DSH_HOME/profiles/node_modules` 模块回退），`pnpm install` 可省略——本包的依赖（`@deepseek-ai/schemastery`、`yaml`）已可直接解析，放好包即可。
+
+3. 在 profile 的 `cordis.patch.yml` 中加入条目：
 
    ```yaml
    - insert:
@@ -47,7 +60,7 @@
            refreshMs: 300000
    ```
 
-3. 重启 DSH 服务并刷新浏览器，侧边栏底部即出现小组件。
+4. 应用并验证。较新版本的 DSH 会通过 HMR 监听器热应用 `cordis.patch.yml` 的变更（宿主路由与客户端启动图无需重启即可重组）——用 `curl -i http://127.0.0.1:3080/ark-quota` 检查；若路由未生效，再重启 DSH 服务并刷新浏览器。侧边栏底部即出现小组件。
 
 ## 获取 Cookie
 
@@ -59,7 +72,7 @@
 
 严格必需的是 `userInfo` + `digest`；`csrfToken` 缺失或过期时，代理会在首次请求时自动恢复。
 
-> 💡 **更省事的方式**：直接运行 `node tools/refresh.mjs`——它会弹出 Edge 并打开订阅页，你登录后自动提取并写入全部 Cookie 到 `$DSH_HOME/settings.yaml`（无需复制粘贴、无需重启）。
+> 💡 **更省事的方式**：直接运行 `node tools/refresh.mjs`——它会弹出你已安装的 Edge/Chrome（macOS 与 Windows）并打开订阅页，你登录后自动提取并写入全部 Cookie 到 `$DSH_HOME/settings.yaml`（无需复制粘贴、无需重启）。
 
 ## 使用
 
