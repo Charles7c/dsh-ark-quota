@@ -95,3 +95,13 @@ gh release create vX.Y.Z --generate-notes
 - `@deepseek-ai/dsh-client-runtime` — `ctx.slots.inject` declaration injection, `bindSettingsScope`.
 - `@deepseek-ai/dsh-settings` / `dsh-settings-file` — host settings registry, hot-reloaded `settings.yaml`.
 - [Cordis](https://github.com/cordiverse/cordis) — the plugin framework everything runs on.
+
+## Cursor Cloud specific instructions
+
+- **No standalone app / dev server lives in this repo.** This package is a *plugin*; it only runs inside a DeepSeek Harness host (`npx @deepseek-ai/dsh web`) that is not vendored here. There is nothing to `pnpm dev` from this repo — don't look for one.
+- **True end-to-end (`curl /ark-quota` → real quota → widget in the DSH sidebar) is not reproducible in the cloud VM.** It needs (a) a running DSH host and (b) real, live `console.volcengine.com` session cookies for a 火山方舟 Coding Plan account, reaching a geo/auth-restricted Chinese console API. Treat that as a user-credentialed step, not a local one.
+- **Validate changes with the plain-Node smoke tests in the Testing section above** (there is no test framework, no ESLint config; `node --check` is the syntax gate). Recipe used successfully in this environment:
+  - Host half: mock `ctx` (`webServer`/`settings`/`effect`/`logger`) and stub global `fetch`, then `apply(ctx, config)` and drive `ctx.__route.handler(req,res)` — this exercises config resolution, cookie hot-refresh via `scope.watch`, CSRF rotation, and the 401/HEAD/405 paths without a server.
+  - Client half: execute `lib/client.js` under a `window.__ModuleLoader__` stub to capture the factory, `factory(require)` with a `require` that returns only `react` / `react/jsx-runtime`, then SSR (`react-dom/server`) or mount (`react-dom/client` + `jsdom`, set the jsdom window as the global `window` before mounting) with a mocked `/ark-quota` payload.
+- **`react` / `react-dom` / `jsdom` are test-only and intentionally NOT plugin dependencies** (the bundle-purity gate forbids bundling React). Install them in a throwaway scratch dir to run the client test; never add them to `package.json`.
+- **Dependency caveat:** the public npm registry only publishes `@deepseek-ai/schemastery` `3.18.x` (the older `0.1.0-rc.x` pins referenced in history were never published there). This repo targets `^3.18.1`, which is API-compatible with the `z.object` / `.default()` / `Config['~standard'].validate` usage in `lib/index.js`.
