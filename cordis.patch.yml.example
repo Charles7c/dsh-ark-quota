@@ -1,15 +1,18 @@
 # Example DSH profile patch entry for dsh-ark-quota.
 # Copy this into your profile's cordis.patch.yml, replacing the PASTE_*
-# placeholders with your OWN console.volcengine.com cookies.
-# NEVER commit real cookie values.
+# placeholders with your OWN Volcengine access keys.
+# NEVER commit real access keys.
+#
+# The access keys are secrets: you may leave them empty here and fill them in
+# from the DSH Settings UI instead (Settings → 方舟额度), which writes them to
+# $DSH_HOME/settings.yaml via the plugin's own /ark-quota/credentials route and
+# hot-applies them — no restart.
 - insert:
     - id: ark-quota
       name: dsh-ark-quota
       config:
-        userInfo: 'PASTE_USERINFO_COOKIE'
-        digest: 'PASTE_DIGEST_COOKIE'
-        csrfToken: ''          # optional; auto-bootstrapped when stale
-        xWebId: 'U2FsdGVkX1/5PNdS+cQxIt+7URSEcJ59ZjjT3gwhknNgNz6mZhgxNfJq59t4lEaP'
+        accessKeyId: ''
+        secretAccessKey: ''
         region: cn-beijing
         version: '2024-01-01'
         refreshMs: 300000

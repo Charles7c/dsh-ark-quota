@@ -4,23 +4,25 @@
 
 **火山方舟（Volcano Ark）Coding Plan 订阅套餐剩余额度** —— DeepSeek Harness（DSH）Web 插件，在侧边栏底部以固定小组件实时展示你的套餐额度，无需离开 DSH 界面。
 
-- 宿主半区（`lib/index.js`）：由于控制台 API 不允许来自 DSH 源（127.0.0.1:3080）的跨域（CORS）请求，由宿主在同源路由 `/ark-quota` 上代理控制台 `GetCodingPlanUsage` 接口。
-- 浏览器半区（`lib/client.js`）：渲染额度卡片 / 窄条百分比胶囊，并在 Cookie 变更时自动刷新。
-- `tools/refresh.mjs`：弹出真实浏览器窗口，你只需登录一次，工具自动提取会话 Cookie 写入 `$DSH_HOME/settings.yaml`——**热生效，无需重启**。
+> 当前版本：`v0.1.0`（版本号见 [VERSION](./VERSION)）
 
-> ⚠️ **安全提醒**：额度接口使用你的**火山方舟控制台 Cookie**（JWT 会话凭据）鉴权，属于火山账号的高度敏感凭据。请务必妥善保管：不要提交到任何仓库、不要粘贴到任何地方（只允许写入你自己的 `cordis.patch.yml` / `settings.yaml`）。
+- 宿主半区（`lib/index.js`）：由于 OpenAPI 网关不允许来自 DSH 源（127.0.0.1:3080）的跨域（CORS）请求，由宿主用你的火山引擎**访问密钥 AK/SK**（SigV4 变体签名）在同源路由 `/ark-quota` 上代理控制面 OpenAPI `GetCodingPlanUsage`（未订阅时自动回落到 Agent Plan 的 `GetAFPUsage`）。**无浏览器、无 Cookie、无 CSRF**。
+- 浏览器半区（`lib/client.js`）：渲染额度卡片 / 窄条百分比胶囊，并在设置变更时自动刷新；同时在 **设置 → 方舟额度** 提供独立的顶级配置分区，可直接在 DSH 设置界面粘贴 AK/SK。
+- `tools/check.mjs`：零依赖 CLI，用你的 AK/SK 签名一次请求并打印套餐额度——配置前后用它验证密钥是否正确。
+
+> ⚠️ **安全提醒**：额度接口使用你的**火山方舟访问密钥（AccessKey ID + Secret）**鉴权，属于火山账号的真实凭据。请务必妥善保管：不要提交到任何仓库、不要粘贴到任何地方（只允许写入你自己的 `cordis.patch.yml` / `settings.yaml`，或 DSH 设置界面——那里以 `role('secret')` 标记、只写不回显）。
 
 ## 功能特性
 
 - **侧边栏固定小组件**：侧边栏底部操作区显示宽版卡片（会话 / 本周 / 本月三条用量进度），窄版显示本月剩余百分比胶囊。
-- **CSRF Token 自动轮换**：控制台返回 `InvalidCSRFToken` 时，代理自动读取响应头 `X-Need-Token` 中的新 token 并重试一次。
-- **免重启维护**：Cookie 从 `ark-quota` 设置命名空间读取（`$DSH_HOME/settings.yaml`，由 `dsh-settings-file` 热重载）。任何变更立即清空缓存——**无需重启服务**。
-- **一键刷新 Cookie**：`tools/refresh.mjs` 弹出你已安装的 Edge/Chrome（macOS 与 Windows），你登录后自动提取并写入 Cookie。
+- **Agent Plan 自动回落**：账号未订阅 Coding Plan 时，代理自动探测 `GetAFPUsage` 并渲染绝对额度窗口。
+- **免重启维护**：密钥从 `ark-quota` 设置命名空间读取（`$DSH_HOME/settings.yaml`，由 `dsh-settings-file` 热重载）。任何变更立即清空缓存——**无需重启服务**。
+- **设置界面配置**：DSH 设置 → **方舟额度** 顶级分区（与「侧边卡片」「配置同步」同级），一键保存 AK/SK（只写字段、热生效）。
 
 ## 环境要求
 
 - DeepSeek Harness Web 运行时（`dsh web`），且组合了 `dsh-settings-file`（默认 Web profile 已包含）。
-- 已开通火山方舟 Coding Plan 套餐，并在 `console.volcengine.com` 保持登录态。
+- 拥有火山引擎账号，已开通方舟 Coding Plan 套餐，并有可用的访问密钥（AK/SK）。
 
 ## 安装
 
@@ -52,9 +54,8 @@
        - id: ark-quota
          name: dsh-ark-quota
          config:
-           userInfo: 'PASTE_USERINFO_COOKIE'
-           digest: 'PASTE_DIGEST_COOKIE'
-           csrfToken: ''        # 可选；失效时代理会自动自举
+           accessKeyId: ''        # 可留空——更推荐直接在 DSH 设置界面填写
+           secretAccessKey: ''
            region: cn-beijing
            version: '2024-01-01'
            refreshMs: 300000
@@ -62,37 +63,31 @@
 
 4. 应用并验证。较新版本的 DSH 会通过 HMR 监听器热应用 `cordis.patch.yml` 的变更（宿主路由与客户端启动图无需重启即可重组）——用 `curl -i http://127.0.0.1:3080/ark-quota` 检查；若路由未生效，再重启 DSH 服务并刷新浏览器。侧边栏底部即出现小组件。
 
-## 获取 Cookie
+## 获取访问密钥
 
-在**已登录**的浏览器中打开 `https://console.volcengine.com/ark/region:cn-beijing/subscription/coding-plan`，按 F12 → Application（应用）→ Cookies → `console.volcengine.com`，复制以下值：
+1. 打开火山引擎控制台 → **访问控制 → API 访问密钥**。
+2. 创建一个访问密钥（AccessKey），记下 **AccessKey ID** 与 **Secret Access Key**。
+3. 填入插件——最省事的方式是在 DSH 设置界面：**设置 → 方舟额度**（写入 `$DSH_HOME/settings.yaml`，热生效、**无需重启**）；也可以在 `cordis.patch.yml` 里配置 `accessKeyId` / `secretAccessKey`。
 
-- `userInfo`
-- `digest`
-- `csrfToken`（可选）
-
-严格必需的是 `userInfo` + `digest`；`csrfToken` 缺失或过期时，代理会在首次请求时自动恢复。
-
-> 💡 **更省事的方式**：直接运行 `node tools/refresh.mjs`——它会弹出你已安装的 Edge/Chrome（macOS 与 Windows）并打开订阅页，你登录后自动提取并写入全部 Cookie 到 `$DSH_HOME/settings.yaml`（无需复制粘贴、无需重启）。
+> 💡 **验证**：运行 `node tools/check.mjs <accessKeyId> <secretAccessKey>`（或 `ARK_AK=… ARK_SK=… node tools/check.mjs`），确认密钥能正确通过火山控制面 OpenAPI 签名并打印你的套餐额度——全程无浏览器。
 
 ## 使用
 
 - 小组件按 `refreshMs`（默认 5 分钟）轮询 `/ark-quota`，并在设置命名空间变更时立即刷新。
 - 点击 **⟳** 按钮（或访问 `/ark-quota?force=1`）可强制立即刷新。
-- 登录态过期时显示错误卡片；运行 `node tools/refresh.mjs` 重新登录即可，组件会自动更新。
+- 密钥缺失或错误时显示错误卡片；在 **设置 → 方舟额度** 里修正（或重跑 `node tools/check.mjs`），组件会自动更新。
 
 ## 配置说明
 
 所有配置存放在 `ark-quota` 设置命名空间。`cordis.patch.yml` 中的组合条目配置作为**基础层（base）**，`$DSH_HOME/settings.yaml` 中的用户层可覆盖它并热生效。
 
-| 键         | 类型   | 默认值       | 说明                                        |
-| ---------- | ------ | ------------ | ------------------------------------------- |
-| `userInfo` | string | *(必填)*     | 控制台 `userInfo` Cookie（JWT）             |
-| `digest`   | string | *(必填)*     | 控制台 `digest` Cookie（JWT）               |
-| `csrfToken`| string | `""`         | 控制台 `csrfToken` Cookie（自动轮换）       |
-| `xWebId`   | string | *(内置)*     | 固定的 `x-web-id` 请求头                    |
-| `region`   | string | `cn-beijing` | 方舟地域                                    |
-| `version`  | string | `2024-01-01` | 控制台 API 版本                             |
-| `refreshMs`| number | `300000`     | 代理缓存有效期，超时后重新拉取              |
+| 键              | 类型   | 默认值       | 说明                                        |
+| --------------- | ------ | ------------ | ------------------------------------------- |
+| `accessKeyId`   | string | `""`（secret）| 火山引擎 AccessKey ID（签名每次 OpenAPI 调用）|
+| `secretAccessKey`| string | `""`（secret）| 火山引擎 Secret Access Key                    |
+| `region`        | string | `cn-beijing` | 方舟地域                                    |
+| `version`       | string | `2024-01-01` | 控制面 OpenAPI 版本                          |
+| `refreshMs`     | number | `300000`     | 代理缓存有效期，超时后重新拉取              |
 
 ## API
 
@@ -114,9 +109,9 @@
 
 ## 安全说明
 
-- `/ark-quota` 路由**仅限本机**（绑定在 DSH 服务上）且**无鉴权**：同一台机器上的任何进程都能读取你的额度数据或触发一次带鉴权的刷新。但它**绝不会回显你的 Cookie**（响应只包含额度数字），也不接受任何用户可控的 URL，因此无法作为代理/SSRF 跳板或泄漏火山凭据。插件加载期间请勿将 DSH 服务暴露到非回环地址。
-- Cookie 是 JWT 会话凭据，存放于 `$DSH_HOME` 下的 `cordis.patch.yml` / `settings.yaml`，**已被 git 排除**（见 `.gitignore`）。
-- `tools/refresh.mjs` 将 CDP 调试端口**仅绑定 127.0.0.1**，并使用操作系统临时目录下的临时浏览器配置，所有退出路径（成功 / 报错 / Ctrl+C）都会清理。**工具运行期间**（即你登录的过程中），本机其他进程可能连上该端口读取弹出浏览器中的会话 Cookie——请登录完让它自动结束即可；不要在共享机器上长时间挂起。
+- `/ark-quota`、`/ark-quota/status`、`/ark-quota/credentials` 三个路由**仅限本机**（绑定在 DSH 服务上）且**无鉴权**：同一台机器上的任何进程都能读取你的额度数据、触发一次带鉴权的刷新，或通过 `POST /ark-quota/credentials` 覆盖你的访问密钥（影响面等同本机可直接读写 `settings.yaml`）。但它们**绝不会回显你的访问密钥**（响应只含布尔状态 / 额度数字），`/ark-quota/credentials` 只接受固定形状的 `accessKeyId` / `secretAccessKey` 两个字符串字段、不接受任何用户可控的 URL，因此无法作为代理/SSRF 跳板或泄漏火山凭据。插件加载期间请勿将 DSH 服务暴露到非回环地址。
+- 访问密钥是真实凭据，存放于 `$DSH_HOME` 下的 `cordis.patch.yml` / `settings.yaml`；在设置 schema 中以 `role('secret')` 声明（DSH 设置界面以只写字段展示、绝不把值回传浏览器），并**已被 git 排除**（见 `.gitignore`）。
+- `tools/check.mjs` 只用命令行 / `ARK_AK` / `ARK_SK` 传入的密钥签名一次请求，**不写盘、不全量打印**。
 
 ## 参与贡献
 

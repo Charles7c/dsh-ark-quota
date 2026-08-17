@@ -4,18 +4,20 @@
 
 A [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) (DSH) web plugin that shows your **火山方舟 (Volcano Ark) Coding Plan subscription quota** as a fixed widget in the sidebar footer — without ever leaving the DSH GUI.
 
-- Host half (`lib/index.js`) proxies the console API `GetCodingPlanUsage` behind a same-origin route (`/ark-quota`), because the console API does not allow CORS from the DSH origin.
-- Browser half (`lib/client.js`) renders the quota card / rail pill and auto-refreshes when the cookies change.
-- `tools/refresh.mjs` pops a real browser, lets you log in once, and extracts the session cookies into `$DSH_HOME/settings.yaml` — hot-applied, **no restart needed**.
+> Current version: `v0.1.0` (see [VERSION](./VERSION))
 
-> ⚠️ **Security note**: the quota API is authenticated with your **火山方舟 console cookies** (JWT session cookies). These are highly sensitive credentials for your Volcano account. Keep them private, never commit them, and never paste them anywhere except your own `cordis.patch.yml` / `settings.yaml`.
+- Host half (`lib/index.js`) signs the **control-plane OpenAPI** `GetCodingPlanUsage` (falling back to `GetAFPUsage` for Agent Plan) with your Volcengine **AK/SK** (SigV4 variant) behind a same-origin route (`/ark-quota`), because the OpenAPI gateway does not allow CORS from the DSH origin. No browser, no cookies, no CSRF.
+- Browser half (`lib/client.js`) renders the quota card / rail pill and auto-refreshes when the settings change; a dedicated **Settings → 方舟额度** section lets you paste the AK/SK straight into the DSH settings UI.
+- `tools/check.mjs` is a zero-dependency CLI that signs one request with your AK/SK and prints your subscription quota — use it to verify keys before/after configuring.
+
+> ⚠️ **Security note**: the quota API is authenticated with your **火山方舟 access keys (AccessKey ID + Secret)**. These are real credentials for your Volcengine account. Keep them private, never commit them, and never paste them anywhere except your own `cordis.patch.yml` / `settings.yaml` (or the DSH settings UI, which marks them `role('secret')` and never returns their values to the browser).
 
 ## Features
 
 - Sidebar footer widget: wide card (session / weekly / monthly usage bars) on the footer action row, or a compact remaining-percent pill.
-- CSRF token auto-rotation: when the console answers `InvalidCSRFToken`, the proxy adopts the token from the `X-Need-Token` response header and retries once.
-- Live maintenance: cookies are read from the `ark-quota` settings namespace (`$DSH_HOME/settings.yaml`, hot-reloaded by `dsh-settings-file`). A change drops the cache immediately — **no server restart**.
-- One-click cookie refresh: `tools/refresh.mjs` opens your installed Edge/Chrome (macOS & Windows), you log in, it extracts and writes the cookies for you.
+- Agent Plan fallback: when the account is not subscribed to Coding Plan, the proxy auto-detects `GetAFPUsage` and renders the absolute quota windows instead.
+- Live maintenance: keys are read from the `ark-quota` settings namespace (`$DSH_HOME/settings.yaml`, hot-reloaded by `dsh-settings-file`). A change drops the cache immediately — **no server restart**.
+- Settings UI: a top-level **方舟额度** section in the DSH settings (sibling of the 侧边卡片 / 配置同步 sections) saves AK/SK with one click (write-only fields, hot-applied).
 
 ## Requirements
 
@@ -49,7 +51,7 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) (DSH) web 
    Then run `pnpm install` in the profile directory. If your harness already provides the
    profile's dependencies (e.g. the `$DSH_HOME/profiles/node_modules` module fallback of an
    `npx`-installed harness), `pnpm install` is optional — the package's deps
-   (`@deepseek-ai/schemastery`, `yaml`) already resolve, so placing the package is enough.
+   (`@deepseek-ai/schemastery`) already resolve, so placing the package is enough.
 
 3. Add an entry to your profile's `cordis.patch.yml`:
 
@@ -58,9 +60,8 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) (DSH) web 
        - id: ark-quota
          name: dsh-ark-quota
          config:
-           userInfo: 'PASTE_USERINFO_COOKIE'
-           digest: 'PASTE_DIGEST_COOKIE'
-           csrfToken: ''        # optional; auto-bootstrapped when stale
+           accessKeyId: ''        # optional here — fill it in the DSH Settings UI instead
+           secretAccessKey: ''
            region: cn-beijing
            version: '2024-01-01'
            refreshMs: 300000
@@ -71,37 +72,35 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) (DSH) web 
    `curl -i http://127.0.0.1:3080/ark-quota`. If the route isn't live, restart the DSH server
    and refresh the browser. The widget appears at the bottom of the sidebar.
 
-## Getting the cookies
+## Getting the access keys
 
-Open `https://console.volcengine.com/ark/region:cn-beijing/subscription/coding-plan` in a browser **while logged in**, open DevTools → Application → Cookies → `console.volcengine.com`, and copy the values of:
+1. Open the Volcengine console → **访问控制 (Access Control) → API 访问密钥 (API Access Keys)**.
+2. Create an AccessKey (or reuse one) and note the **AccessKey ID** and **Secret Access Key**.
+3. Fill them into the plugin — easiest from the DSH Settings UI: **Settings → 方舟额度**
+   (saved to `$DSH_HOME/settings.yaml`, hot-applied, **no restart needed**). Or set
+   `accessKeyId` / `secretAccessKey` in `cordis.patch.yml`.
 
-- `userInfo`
-- `digest`
-- `csrfToken` (optional)
-
-Only `userInfo` + `digest` are strictly required; the proxy recovers a stale or missing `csrfToken` automatically on first request.
-
-> 💡 **Easier**: run `node tools/refresh.mjs` — it pops your installed Edge/Chrome (macOS & Windows) at the subscription page, you log in, and it extracts and writes all cookies into `$DSH_HOME/settings.yaml` automatically (no copy/paste, no restart).
+> 💡 **Verify**: run `node tools/check.mjs <accessKeyId> <secretAccessKey>` (or
+> `ARK_AK=… ARK_SK=… node tools/check.mjs`) to confirm the keys sign correctly against the Ark
+> control-plane OpenAPI and print your subscription quota — no browser involved.
 
 ## Usage
 
 - The widget polls `/ark-quota` every `refreshMs` (default 5 min) and every time the settings namespace changes.
 - Click the **⟳** button (or `?force=1`) for an immediate refetch.
-- When the session expires you'll see an error card; run `node tools/refresh.mjs`, log in again, and the widget updates itself.
+- When the keys are missing or wrong you'll see an error card; fix them in Settings → 方舟额度 (or re-run `node tools/check.mjs`) and the widget updates itself.
 
 ## Configuration
 
 All settings live in the `ark-quota` settings namespace. The composition entry config in `cordis.patch.yml` is the **base**; the user layer in `$DSH_HOME/settings.yaml` overrides it and is hot-applied.
 
-| key        | type   | default      | description                                |
-| ---------- | ------ | ------------ | ------------------------------------------ |
-| `userInfo` | string | *(required)* | console `userInfo` cookie (JWT)            |
-| `digest`   | string | *(required)* | console `digest` cookie (JWT)              |
-| `csrfToken`| string | `""`         | console `csrfToken` cookie (auto-rotated)  |
-| `xWebId`   | string | *(built-in)* | constant `x-web-id` header                 |
-| `region`   | string | `cn-beijing` | Ark region                                 |
-| `version`  | string | `2024-01-01` | console API version                        |
-| `refreshMs`| number | `300000`     | proxy cache TTL before refetching          |
+| key             | type   | default      | description                                       |
+| --------------- | ------ | ------------ | ------------------------------------------------- |
+| `accessKeyId`   | string | `""` (secret)| Volcengine AccessKey ID (signs every OpenAPI call)|
+| `secretAccessKey`| string | `""` (secret)| Volcengine Secret Access Key                       |
+| `region`        | string | `cn-beijing` | Ark region                                        |
+| `version`       | string | `2024-01-01` | control-plane OpenAPI version                     |
+| `refreshMs`     | number | `300000`     | proxy cache TTL before refetching                 |
 
 ## API
 
@@ -123,9 +122,9 @@ On failure: `{ "ok": false, "code": "unauthorized" | "upstream" | "network", "me
 
 ## Security notes
 
-- The `/ark-quota` route is **localhost-only** (bound to the DSH server) and is **unauthenticated**: any process on the same machine can read your quota figures or force an authenticated refresh. It **never echoes your cookies** (the response is shaped to quota numbers only) and accepts no user-controlled URL, so it cannot be used as a proxy/SSRF vector or leak the Volcano credentials. Don't expose the DSH server beyond loopback while this plugin is loaded.
-- Cookies are JWT session credentials. They are stored in `cordis.patch.yml` / `settings.yaml` under `$DSH_HOME` and are **excluded from git** (see `.gitignore`).
-- `tools/refresh.mjs` binds the CDP debugging port to **127.0.0.1 only** and uses a throwaway browser profile under the OS temp dir which is removed on every exit path (success, error, Ctrl+C). **While the refresh tool is running** (i.e. during your login), any other local process could connect to that port and read the session cookies of the popped browser — so log in, let it finish, and close it; don't leave it running on a shared machine.
+- The `/ark-quota`, `/ark-quota/status`, and `/ark-quota/credentials` routes are **localhost-only** (bound to the DSH server) and are **unauthenticated**: any process on the same machine can read your quota figures, force an authenticated refresh, or overwrite your access keys via `POST /ark-quota/credentials` (the same exposure as directly editing `settings.yaml` on that machine). They **never echo your access keys** (responses carry only booleans / quota numbers), and `/ark-quota/credentials` accepts only a fixed-shape `accessKeyId` / `secretAccessKey` pair of strings — no user-controlled URL, so they cannot be used as a proxy/SSRF vector or leak the Volcengine credentials. Don't expose the DSH server beyond loopback while this plugin is loaded.
+- Access keys are real credentials. They are stored in `cordis.patch.yml` / `settings.yaml` under `$DSH_HOME`, declared with `role('secret')` in the settings schema (the DSH settings UI shows them as write-only fields and never sends their values back to the browser), and are **excluded from git** (see `.gitignore`).
+- `tools/check.mjs` only signs one request with the keys you pass on the command line / via `ARK_AK`/`ARK_SK`; it never writes them to disk and never prints them in full.
 
 ## Contributing
 

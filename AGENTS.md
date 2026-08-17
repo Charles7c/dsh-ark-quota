@@ -13,10 +13,11 @@ hand-written bundle consumed by the DSH client module loader.
 
 | path | what it is |
 | --- | --- |
-| `lib/index.js` | Host half (ESM): registers the `ark-quota` settings namespace + the same-origin `/ark-quota` proxy route. |
+| `lib/index.js` | Host half (ESM): registers the `ark-quota` settings namespace + the same-origin `/ark-quota` proxy route (signed control-plane OpenAPI), plus the plugin-owned `/ark-quota/status` + `/ark-quota/credentials` routes that read/write the namespace straight through the host seam (see "Settings write path" below). |
+| `lib/signature.js` | Volcengine SigV4-variant signer (pure `node:crypto`, no network/state) — shared by host and `tools/check.mjs`. |
 | `lib/client.js` | Browser half: shipped client bundle in `window.__ModuleLoader__.load({ id, factory })` format. **No build step — edit this file directly.** |
-| `tools/refresh.mjs` | Standalone Node CLI (no DSH imports): pops Edge via CDP, extracts console cookies after login, writes them atomically to `$DSH_HOME/settings.yaml`. |
-| `cordis.patch.yml.example` | Example profile entry; only `PASTE_*` placeholders are allowed. |
+| `tools/check.mjs` | Standalone Node CLI (no DSH imports): signs one `GetCodingPlanUsage`/`GetAFPUsage` request with AK/SK and prints the quota — for verifying keys. |
+| `cordis.patch.yml.example` | Example profile entry; AK/SK may be left empty and filled from the DSH Settings UI. |
 | `README.md` / `README.zh-CN.md` | User docs — keep bilingual in sync. |
 
 ## Load mechanics (know before editing)
@@ -29,52 +30,54 @@ hand-written bundle consumed by the DSH client module loader.
 ## Conventions — host (`lib/index.js`)
 
 - Register everything through `ctx.effect(fn, label)` (fiber-scoped teardown).
-- The settings namespace (`ctx.settings.register(ARK_QUOTA_NS, SettingsSchema, { base })`) is the live-maintenance seam: read the **effective** config from the scope (`scope.get()`), never the static `config`; the `scope.watch` handler must drop the in-memory csrf token and cache so cookie refreshes apply without restart.
-- CSRF rotation: on `InvalidCSRFToken`, adopt `X-Need-Token` and retry once (one retry only).
+- The settings namespace (`ctx.settings.register(ARK_QUOTA_NS, SettingsSchema, { base })`) is the live-maintenance seam: read the **effective** config from the scope (`scope.get()`), never the static `config`; the `scope.watch` handler must drop the cache so an AK/SK change applies without restart.
+- Sign every upstream call with `lib/signature.js` (`buildSignedRequest`) against `open.volcengineapi.com`; probe Coding Plan first (`GetCodingPlanUsage`), fall back to Agent Plan (`GetAFPUsage`) when coding is not subscribed.
+- Keep AK/SK off every wire surface: declare them `role("secret")` in `Config`/`SettingsSchema`, never log full values, never echo them in responses.
 - Validate config with `Config['~standard'].validate(config)` (schemastery implements Standard Schema).
-- The route must never echo cookies; accept only fixed-shape inputs (no user-controlled URLs — no SSRF surface).
-- Proxy failures map to honest statuses: `unauthorized` → 401, `network` → 504, else 502; HEAD returns no body.
+- The route must never echo credentials; accept only fixed-shape inputs (no user-controlled URLs — no SSRF surface).
+- Proxy failures map to honest statuses: `unauthorized`/`missing-auth` → 401, `network` → 504, else 502; HEAD returns no body.
 
 ## Conventions — client (`lib/client.js`)
 
 - Keep the loader format exactly: `window.__ModuleLoader__.load({ id: "dsh-ark-quota", factory: (require) => {...} })`.
 - `require` only `react` / `react/jsx-runtime` (plus `react-dom` in tests) — the bundle purity gate forbids cross-plugin value imports; collaborate via cordis services.
 - Register the widget with `ctx.slots.inject("sidebar.footer.action", () => ctx.slots.register({ name, id, order, label, inject }, Component))` — the slot is shell-declared; `slots.inject` waits for the declaration.
-- Bind settings with `ctx.settingsScope.bind({ namespace: "ark-quota" })` and expose it through the registration `inject` → `hooks` face; refetch when the settings revision changes.
+- Register the settings section with `ctx.slots.inject("settings.section", () => ctx.slots.register({ name: "settings.section", id: "ark-quota", order, label }, SectionComponent))` — a top-level entry in the Settings nav (sibling of the built-in sections), not a card nested under 插件.
+- **Settings write path (why NOT settingsScope):** the DSH configuration client only exposes the platform's own namespaces — third-party namespaces answer `settings-not-exposed` for both `settings.describe` and writes, and the client silently swallows the refusal (so a "已保存" message can lie). Real reads/writes therefore go through the plugin-owned host routes (`GET /ark-quota/status`, `POST /ark-quota/credentials` → `settingsScope.update(patch)` on the host side, bypassing the proxy allowlist). Same pattern as dsh-config-sync. After a save, the client fires the module-scope `refreshSignal` so every mounted widget re-reads the quota immediately. Never echo credential values back in route responses — booleans only.
 - Render everything through React elements/attributes (React escapes). **Never** `dangerouslySetInnerHTML` / `innerHTML` with console-derived strings.
 - Look up level labels with `Object.prototype.hasOwnProperty.call(...)`, never bare `obj[key] || fallback` (prototype keys).
 
-## Conventions — tools (`tools/refresh.mjs`)
+## Conventions — tools (`tools/check.mjs`)
 
-- Bind the CDP port to `127.0.0.1` only (`--remote-debugging-address=127.0.0.1`).
-- Tear down on **every** exit path: graceful `Browser.close`, fallback `taskkill /T /F`, `rm` of the throwaway profile, SIGINT/SIGTERM handlers, try/finally.
-- Write `settings.yaml` atomically (temp file + `rename`).
-- Never print full cookie values — truncate (`slice(0,12) + "…" + slice(-8)`).
-- Match cookie domains with `endsWith(".volcengine.com")`, not `includes`.
+- Zero-dependency CLI: reuse `lib/signature.js` (`buildSignedRequest`) to sign one `GetCodingPlanUsage`/`GetAFPUsage` request.
+- Accept keys from argv (`node tools/check.mjs <ak> <sk>`) or `ARK_AK`/`ARK_SK` env; never write them to disk.
+- Never print full key values — truncate (`slice(0,12) + "…"`).
+- Exit code: 0 = verified + quota, 2 = auth failure with a fix hint, 1 = usage/other error.
 
 ## Security invariants (MANDATORY)
 
-This plugin moves **real session credentials** (Volcano Ark console cookies: `userInfo`/`digest` JWTs, `csrfToken`). Treat them as passwords.
+This plugin moves **real credentials** (Volcengine access keys: `accessKeyId` / `secretAccessKey`). Treat them as passwords.
 
-1. Never commit real cookies/tokens/keys — any file, any commit, any branch. `PASTE_*` placeholders only in docs/examples.
-2. Never log full cookie values.
-3. Never echo cookies in HTTP responses.
+1. Never commit real keys/tokens — any file, any commit, any branch. `PASTE_*` placeholders only in docs/examples.
+2. Never log full key values.
+3. Never echo keys in HTTP responses; keep them `role("secret")` in the settings schema so the DSH UI treats them as write-only.
 4. `.gitignore` is the last line of defense (`settings.yaml`, `cordis.patch.yml`, `.dsh/`, `.env`, `.npmrc`); ignore any new file that could hold credentials.
-5. The CDP tool runs a browser holding a live session: loopback-only, short-lived, cleaned up on every path. Never turn it into a long-running service.
-6. Before any push, run the secret scan:
+5. Before any push, run the secret scan:
 
    ```sh
-   grep -rInE 'eyJhbGciOi|ark-[A-Za-z0-9]{20,}|gho_|ghp_|github_pat_|AKLT|Bearer [A-Za-z0-9._-]{20,}' .
+   grep -rInE 'eyJhbGciOi|ark-[A-Za-z0-9]{20,}|AKLT[A-Za-z0-9]{10,}|gho_|ghp_|github_pat_|AKIA|Bearer [A-Za-z0-9._-]{20,}' .
    ```
 
-   Output must contain no real values (code references like `csrfToken` field names and `PASTE_*` are acceptable).
+   Output must contain no real values (code references like `accessKeyId` field names and `PASTE_*` are acceptable).
 
 ## Testing (no framework — plain Node scripts)
 
-1. Syntax: `node --check lib/index.js lib/client.js tools/refresh.mjs`.
-2. Host smoke test (mock `ctx` with `webServer`/`settings`/`effect`/`logger`, no server): namespace registers with patch config as base; `scope.get()` drives effective config; a settings change (watch callback) makes the next request carry the new cookies; broken cookies → `401` + `ok:false`; HEAD → no body.
-3. Client render smoke test: load the bundle under a `window.__ModuleLoader__` stub, `apply` with mock `slots`/`settingsScope`, SSR with `react-dom/server` (wide + rail).
-4. End-to-end: restart DSH → `curl http://127.0.0.1:3080/ark-quota?force=1` returns fresh quota → widget renders in the sidebar footer → run `tools/refresh.mjs` once and confirm the widget updates without restart.
+1. Syntax: `node --check lib/index.js lib/signature.js lib/client.js tools/check.mjs`.
+2. Signature unit checks (`lib/signature.js`): deterministic signing, URL/header shape (`host;x-date;x-content-sha256;content-type`), `X-Date` `YYYYMMDDTHHMMSSZ` format, `Authorization: HMAC-SHA256 Credential=…` structure.
+3. Host smoke test (mock `ctx` with `webServer`/`settings`/`effect`/`logger`, no server): namespace registers with patch config as base; `scope.get()` drives effective config; a settings change (watch callback) drops the cache; missing keys → `missing-auth` 401; broken keys → 401 with a signed request; coding-plan success shape; agent-plan fallback; HEAD → no body; network → 504.
+4. Client render smoke test: load the bundle under a `window.__ModuleLoader__` stub, `apply` with mock `slots` (inject = `["slots"]` only, no settingsScope), SSR with `react-dom/server` (wide + rail + settings section).
+5. Host route smoke test (mock `ctx`, no server): `/ark-quota/status` returns booleans without leaking keys; `POST /ark-quota/credentials` trims + allowlists only `accessKeyId`/`secretAccessKey`, persists via `scope.update`, returns no secret echo; empty body → 400, GET → 405.
+6. End-to-end: restart DSH → `curl http://127.0.0.1:3080/ark-quota?force=1` returns fresh quota → widget renders in the sidebar footer → save AK/SK in the Settings → 方舟额度 section and confirm the widget updates without restart.
 
 ## Release gate
 
