@@ -17,6 +17,7 @@ hand-written bundle consumed by the DSH client module loader.
 | `lib/signature.js` | Volcengine SigV4-variant signer (pure `node:crypto`, no network/state) — shared by host and `tools/check.mjs`. |
 | `lib/client.js` | Browser half: shipped client bundle in `window.__ModuleLoader__.load({ id, factory })` format. **No build step — edit this file directly.** |
 | `tools/check.mjs` | Standalone Node CLI (no DSH imports): signs one `GetCodingPlanUsage`/`GetAFPUsage` request with AK/SK and prints the quota — for verifying keys. |
+| `tools/patch-settings-icon.mjs` | Idempotent shell patch (run manually, not on load): gives the 方舟额度 settings-nav tab its own icon. DSH's settings nav icon is hardcoded by section id in `dsh-client-ui-settings-general` (unknown ids → gear) with no plugin hook, so the 火山方舟 mark is injected as one extra `navIcon("ark-quota")` branch in that shell's client bundle. Re-run after any DSH upgrade resets `node_modules`; `--revert` restores from the `.ark-orig` backup. |
 | `cordis.patch.yml.example` | Example profile entry; AK/SK may be left empty and filled from the DSH Settings UI. |
 | `README.md` / `README.zh-CN.md` | User docs — keep bilingual in sync. |
 
