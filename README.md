@@ -4,7 +4,7 @@
 
 A [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) (DSH) web plugin that shows your **火山方舟 (Volcano Ark) Coding Plan subscription quota** as a fixed widget in the sidebar footer — without ever leaving the DSH GUI.
 
-> Current version: `v0.1.0` (see [VERSION](./VERSION))
+> Current version: `v0.1.1` (see [VERSION](./VERSION))
 
 - Host half (`lib/index.js`) signs the **control-plane OpenAPI** `GetCodingPlanUsage` (falling back to `GetAFPUsage` for Agent Plan) with your Volcengine **AK/SK** (SigV4 variant) behind a same-origin route (`/ark-quota`), because the OpenAPI gateway does not allow CORS from the DSH origin. No browser, no cookies, no CSRF.
 - Browser half (`lib/client.js`) renders the quota card / rail pill and auto-refreshes when the settings change; a dedicated **Settings → 方舟额度** section lets you paste the AK/SK straight into the DSH settings UI.
@@ -100,7 +100,7 @@ All settings live in the `ark-quota` settings namespace. The composition entry c
 | `secretAccessKey`| string | `""` (secret)| Volcengine Secret Access Key                       |
 | `region`        | string | `cn-beijing` | Ark region                                        |
 | `version`       | string | `2024-01-01` | control-plane OpenAPI version                     |
-| `refreshMs`     | number | `300000`     | proxy cache TTL before refetching                 |
+| `refreshMs`     | number | `300000`     | proxy cache TTL; one of `60000` / `300000` / `600000` / `1800000` / `3600000`. Other values snap to the nearest allowlisted cadence. |
 
 ## API
 
@@ -109,14 +109,19 @@ All settings live in the `ark-quota` settings namespace. The composition entry c
 ```json
 {
   "ok": true,
+  "plan": "coding-plan",
   "status": "Normal",
   "updatedAt": 1786639101,
+  "cachedAt": 1786639101000,
+  "refreshMs": 300000,
   "hasReward": false,
   "quota": [
-    { "level": "monthly", "percentUsed": 90.18, "percentRemaining": 9.82, "cap": 100, "rewardTotalPercent": 0, "resetAt": 1786639101 }
+    { "level": "monthly", "percentUsed": 90.18, "percentRemaining": 9.82, "cap": 100, "rewardTotalPercent": 0, "resetAt": 1786639101, "used": 90, "total": 100 }
   ]
 }
 ```
+
+`cachedAt` is milliseconds since epoch (the moment this payload entered the host cache). `updatedAt` / `resetAt` stay unix seconds as returned by the console API.
 
 On failure: `{ "ok": false, "code": "unauthorized" | "upstream" | "network", "message": "…" }` (HTTP 401 / 502 / 504 respectively).
 
