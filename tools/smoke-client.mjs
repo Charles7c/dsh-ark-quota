@@ -19,7 +19,6 @@ if (!scratchReq) {
 }
 
 const React = scratchReq("react");
-const { createRoot } = scratchReq("react-dom/client");
 const { JSDOM } = scratchReq("jsdom");
 
 let failed = 0;
@@ -75,7 +74,9 @@ async function main() {
   globalThis.document = window.document;
   globalThis.HTMLElement = window.HTMLElement;
   globalThis.Node = window.Node;
-  window.React = React;
+  globalThis.Event = window.Event;
+  globalThis.MouseEvent = window.MouseEvent;
+  const { createRoot } = scratchReq("react-dom/client");
 
   let factory;
   window.__ModuleLoader__ = {
@@ -90,14 +91,9 @@ async function main() {
     throw new Error("unexpected require: " + id);
   });
 
-  let pending = [];
   window.fetch = async (url, opts = {}) => {
     const u = String(url);
     const method = (opts.method || "GET").toUpperCase();
-    if (pending.length) {
-      const gate = pending.shift();
-      await gate;
-    }
     if (u.startsWith("/ark-quota/status")) {
       return { json: async () => ({ ...statusJson }) };
     }
@@ -112,6 +108,7 @@ async function main() {
     }
     throw new Error("unexpected fetch " + u);
   };
+  globalThis.fetch = window.fetch;
 
   let Widget;
   let Settings;
@@ -144,11 +141,16 @@ async function main() {
   const inputs = mount.querySelectorAll("input");
   const ak = inputs[0];
   const sk = inputs[1];
-  const setNative = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-  setNative.call(ak, "test-ak-id");
-  ak.dispatchEvent(new window.Event("input", { bubbles: true }));
-  setNative.call(sk, "test-sk");
-  sk.dispatchEvent(new window.Event("input", { bubbles: true }));
+  function changeInput(el, value) {
+    const tracker = el._valueTracker;
+    if (tracker) tracker.setValue("");
+    const setNative = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+    setNative.call(el, value);
+    el.dispatchEvent(new window.Event("input", { bubbles: true }));
+    el.dispatchEvent(new window.Event("change", { bubbles: true }));
+  }
+  changeInput(ak, "test-ak-id");
+  changeInput(sk, "test-sk");
   const saveBtn = [...mount.querySelectorAll("button")].find((b) => /保存访问密钥/.test(b.textContent));
   saveBtn.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
   await waitFor(() => mount.textContent.includes("已保存并热生效"));

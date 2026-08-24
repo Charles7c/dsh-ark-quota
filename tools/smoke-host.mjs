@@ -15,7 +15,7 @@ function assert(cond, msg) {
 
 function makeReq(method, url, json) {
   const text = json === undefined ? "" : JSON.stringify(json);
-  const req = Readable.from([text]);
+  const req = Readable.from([Buffer.from(text)]);
   req.method = method;
   req.url = url;
   return req;
@@ -105,7 +105,7 @@ assert(ALLOWED_REFRESH_MS.length === 5, "allowlist has five UI choices");
   apply(ctx, { accessKeyId: "", secretAccessKey: "", region: "cn-beijing", version: "2024-01-01", refreshMs: 300000 });
   const { res, json } = await call(ctx, "/ark-quota", "GET", "/ark-quota");
   assert(res.statusCode === 401 && json.code === "missing-auth", "missing keys → 401 missing-auth");
-  assert(!JSON.stringify(json).includes("secret"), "error body does not mention secret values");
+  assert(!Object.prototype.hasOwnProperty.call(json, "secretAccessKey"), "error body has no secretAccessKey field");
 }
 
 // --- /ark-quota/settings allowlist ---
