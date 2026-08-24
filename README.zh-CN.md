@@ -4,7 +4,7 @@
 
 **火山方舟（Volcano Ark）Coding Plan 订阅套餐剩余额度** —— DeepSeek Harness（DSH）Web 插件，在侧边栏底部以固定小组件实时展示你的套餐额度，无需离开 DSH 界面。
 
-> 当前版本：`v0.1.0`（版本号见 [VERSION](./VERSION)）
+> 当前版本：`v0.1.1`（版本号见 [VERSION](./VERSION)）
 
 - 宿主半区（`lib/index.js`）：由于 OpenAPI 网关不允许来自 DSH 源（127.0.0.1:3080）的跨域（CORS）请求，由宿主用你的火山引擎**访问密钥 AK/SK**（SigV4 变体签名）在同源路由 `/ark-quota` 上代理控制面 OpenAPI `GetCodingPlanUsage`（未订阅时自动回落到 Agent Plan 的 `GetAFPUsage`）。**无浏览器、无 Cookie、无 CSRF**。
 - 浏览器半区（`lib/client.js`）：渲染额度卡片 / 窄条百分比胶囊，并在设置变更时自动刷新；同时在 **设置 → 方舟额度** 提供独立的顶级配置分区，可直接在 DSH 设置界面粘贴 AK/SK。
@@ -87,7 +87,7 @@
 | `secretAccessKey`| string | `""`（secret）| 火山引擎 Secret Access Key                    |
 | `region`        | string | `cn-beijing` | 方舟地域                                    |
 | `version`       | string | `2024-01-01` | 控制面 OpenAPI 版本                          |
-| `refreshMs`     | number | `300000`     | 代理缓存有效期，超时后重新拉取              |
+| `refreshMs`     | number | `300000`     | 代理缓存有效期；仅允许 `60000` / `300000` / `600000` / `1800000` / `3600000`。其它值会吸附到最近的白名单档位。 |
 
 ## API
 
@@ -96,14 +96,19 @@
 ```json
 {
   "ok": true,
+  "plan": "coding-plan",
   "status": "Normal",
   "updatedAt": 1786639101,
+  "cachedAt": 1786639101000,
+  "refreshMs": 300000,
   "hasReward": false,
   "quota": [
-    { "level": "monthly", "percentUsed": 90.18, "percentRemaining": 9.82, "cap": 100, "rewardTotalPercent": 0, "resetAt": 1786639101 }
+    { "level": "monthly", "percentUsed": 90.18, "percentRemaining": 9.82, "cap": 100, "rewardTotalPercent": 0, "resetAt": 1786639101, "used": 90, "total": 100 }
   ]
 }
 ```
+
+`cachedAt` 为毫秒时间戳（该 payload 写入宿主缓存的时刻）。`updatedAt` / `resetAt` 仍为控制台 API 返回的 unix 秒。
 
 失败时返回：`{ "ok": false, "code": "unauthorized" | "upstream" | "network", "message": "…" }`（HTTP 状态码分别为 401 / 502 / 504）。
 
