@@ -179,6 +179,74 @@ assert(ALLOWED_REFRESH_MS.length === 5, "allowlist has five UI choices");
   }
 }
 
+// --- resetAt / updatedAt unit normalization ---
+// The console is not self-consistent: GetCodingPlanUsage returns epoch SECONDS
+// while GetAFPUsage returns MILLISECONDS. Feeding ms into the client's
+// seconds-based formatter rendered "20678903 天后重置", so toEpochSeconds()
+// pins the unit at the parse boundary.
+{
+  const RESET_S = Math.floor(Date.now() / 1000) + 3 * 3600;
+  const RESET_MS = RESET_S * 1000;
+  const orig = globalThis.fetch;
+  const stub = (body) => {
+    globalThis.fetch = async () => ({ status: 200, async text() { return JSON.stringify(body); } });
+  };
+  const creds = {
+    accessKeyId: "test-ak-id",
+    secretAccessKey: "test-sk",
+    region: "cn-beijing",
+    version: "2024-01-01",
+    refreshMs: 300000
+  };
+  const quotaOnce = async (body) => {
+    stub(body);
+    const ctx = mockCtx();
+    apply(ctx, creds);
+    return (await call(ctx, "/ark-quota", "GET", "/ark-quota")).json;
+  };
+
+  try {
+    // Agent Plan: milliseconds upstream must land as seconds.
+    const afp = await quotaOnce({
+      Result: { AFPFiveHour: { Quota: 100, Used: 25, ResetTime: RESET_MS } }
+    });
+    const session = afp.quota.find((q) => q.level === "session");
+    assert(session.resetAt === RESET_S, "agent-plan ms ResetTime normalized to seconds");
+    const days = Math.floor((session.resetAt * 1000 - Date.now()) / 86400000);
+    assert(days === 0, "agent-plan reset is hours away, not ~20678903 days");
+
+    // Coding Plan: seconds upstream must pass through untouched.
+    const coding = await quotaOnce({
+      Result: { QuotaUsage: [{ Level: "weekly", Percent: 40, ResetTime: RESET_S }] } });
+    assert(coding.quota[0].resetAt === RESET_S, "coding-plan seconds ResetTime unchanged");
+
+    // The core invariant: the same instant in either unit agrees.
+    const asMs = await quotaOnce({
+      Result: { QuotaUsage: [{ Level: "weekly", Percent: 40, ResetTime: RESET_MS }] } });
+    assert(asMs.quota[0].resetAt === coding.quota[0].resetAt, "either unit → identical resetAt");
+
+    // Absent/zero/non-numeric must stay null (never a 1970 fallback).
+    const junk = await quotaOnce({
+      Result: { QuotaUsage: [
+        { Level: "weekly", Percent: 40 },
+        { Level: "monthly", Percent: 10, ResetTime: 0 },
+        { Level: "session", Percent: 10, ResetTime: "soon" }
+      ] }
+    });
+    assert(junk.quota.every((q) => q.resetAt === null), "missing/zero/non-numeric ResetTime → null");
+
+    // ResetTimestamp alias and UpdateTimestamp go through the same gate.
+    const alias = await quotaOnce({
+      Result: { QuotaUsage: [{ Level: "weekly", Percent: 40, ResetTimestamp: RESET_MS }] } });
+    assert(alias.quota[0].resetAt === RESET_S, "ResetTimestamp alias ms normalized");
+    const updated = await quotaOnce({
+      Result: { UpdateTimestamp: RESET_MS, QuotaUsage: [{ Level: "weekly", Percent: 1 }] } });
+    assert(updated.updatedAt === RESET_S, "updatedAt ms UpdateTimestamp normalized");
+  } finally {
+    globalThis.fetch = orig;
+  }
+}
+
 if (failed) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
