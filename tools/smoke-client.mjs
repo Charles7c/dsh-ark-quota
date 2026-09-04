@@ -131,7 +131,61 @@ async function main() {
   await waitFor(() => mount.textContent.includes("刚刚更新"));
   assert(mount.textContent.includes("刚刚更新"), "footer uses cachedAt → 刚刚更新");
   assert(!mount.textContent.includes("10 分钟前更新"), "footer does not use stale updatedAt");
-  assert(mount.textContent.includes("每 5 分钟自动刷新"), "cadence label from refreshMs");
+  // 刷新节奏不再占版面：完整文案挂在刷新按钮的 title 上。
+  const refreshBtn = [...mount.querySelectorAll("button")].find((b) => /立即刷新/.test(b.getAttribute("title") || ""));
+  assert(!!refreshBtn, "refresh button is present");
+  assert(/每 5 分钟自动刷新/.test(refreshBtn.getAttribute("title")), "cadence lives on the refresh button title");
+  assert(!/5 分钟/.test(mount.textContent), "cadence text no longer occupies the card body");
+  // 显示模式胶囊常驻头部，明示当前看的是已用还是剩余。
+  const pill = [...mount.querySelectorAll("button")].find((b) => /^(已用|剩余)$/.test(b.textContent.trim()));
+  assert(!!pill, "display-mode pill is present in the header");
+  assert(pill.textContent.trim() === "已用", "pill reflects the default used mode");
+  // 更新时间靠右下角：它和奖励徽章之间有一个弹性占位。
+  const footerSpacer = [...mount.querySelectorAll("span")].some((s) => /flex:\s*1/.test(s.getAttribute("style") || ""));
+  assert(footerSpacer, "footer pushes the update time to the right");
+
+  // 进度条：填充宽度 = 已用百分比，颜色按阈值切换（40% → 绿色系，同色系浅→深）。
+  // jsdom 经 CSSOM 重新序列化 style，hex 会变成 rgb()，两种形式都接受。
+  await waitFor(() => [...mount.querySelectorAll("div")].some((d) => /linear-gradient/.test(d.getAttribute("style") || "")));
+  const styles = [...mount.querySelectorAll("div")].map((d) => d.getAttribute("style") || "");
+  const fill = styles.find((s) => /linear-gradient/.test(s));
+  assert(!!fill, "progress bar fill is present");
+  // 40% 已用 → 填充宽 40%
+  assert(/width:\s*40%/.test(fill), "fill width equals used percent (40%)");
+  // 绿色系两个色标：#63c07c → #46a758
+  assert(
+    /(#63c07c|rgb\(99, 192, 124\))/i.test(fill) && /(#46a758|rgb\(70, 167, 88\))/i.test(fill),
+    "low-usage fill stays in the green hue (no rainbow band)"
+  );
+  // 不能出现跨色系的黄/红色标（那是彩带写法的特征）。
+  assert(!/(#f5c518|#e5484d|rgb\(245, 197, 24\)|rgb\(229, 72, 77\))/i.test(fill), "fill has no cross-hue stops");
+  // 轨道底色：同色系淡色（40% → 绿色 18% 透明度），而不是灰底。
+  const trackStyle = styles.find((s) => /rgba\(70, 167, 88, 0\.18\)/.test(s));
+  assert(!!trackStyle, "track uses a translucent same-hue tint (green at 40%)");
+  assert(!/--dsw-alias-track-bg/.test(trackStyle), "track no longer falls back to the grey theme token");
+
+  // 阈值回归：62% 已用必须进入橙色档（50~80%），不能还是绿色。
+  const quota62 = { ...quotaJson, quota: [{ ...quotaJson.quota[0], percentUsed: 62, percentRemaining: 38, used: 62 }] };
+  window.fetch = async (url, opts = {}) => {
+    const u = String(url);
+    const method = (opts.method || "GET").toUpperCase();
+    if (u.startsWith("/ark-quota/status")) return { json: async () => ({ ...statusJson }) };
+    if (u.startsWith("/ark-quota/credentials") && method === "POST") {
+      return { json: async () => ({ ok: true, configured: true, refreshMs: 600000 }) };
+    }
+    if (u.startsWith("/ark-quota/settings") && method === "POST") {
+      return { json: async () => ({ ok: true, configured: true, refreshMs: JSON.parse(opts.body).refreshMs }) };
+    }
+    if (u.startsWith("/ark-quota")) return { json: async () => ({ ...quota62 }) };
+    throw new Error("unexpected fetch " + u);
+  };
+  globalThis.fetch = window.fetch;
+  rootApi.render(React.createElement(Widget, { wide: true, key: "bar62" }));
+  const isOrange = (s) => /#ffc95c|#f5a524|rgb\(255, 201, 92\)|rgb\(245, 165, 36\)/i.test(s);
+  await waitFor(() => [...mount.querySelectorAll("div")].some((d) => isOrange(d.getAttribute("style") || "")));
+  const fill62 = [...mount.querySelectorAll("div")].map((d) => d.getAttribute("style") || "").find((s) => /linear-gradient/.test(s));
+  assert(isOrange(fill62), "62% used fills orange (50% threshold, not green)");
+  assert(!/#63c07c|#46a758|rgb\(99, 192, 124\)|rgb\(70, 167, 88\)/i.test(fill62), "62% used shows no green stop");
 
   // Settings: save credentials must keep refreshMs on the select.
   rootApi.render(React.createElement(Settings, {}));
