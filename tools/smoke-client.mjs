@@ -64,6 +64,51 @@ const quotaJson = {
 
 const statusJson = { ok: true, configured: true, accessKeyIdSet: true, secretAccessKeySet: true, refreshMs: 600000 };
 
+// 请求统计桩：468 次请求、99.8% 成功、近 30 分钟 25 次。
+// 健康条按业界 status strip 口径：每格 2 分钟，宿主直接给出 status 分档。
+// 刻意造出三种档位，验证客户端不再自己按 fail>0 判定：
+//   i=5  → 100 成功 / 1 失败 = 99.0% → 正常（旧实现会错标成红色）
+//   i=11 →  19 成功 / 1 失败 = 95.0% → 降级
+//   i=17 →   1 成功 / 1 失败 = 50.0% → 故障
+const DOT_SPAN_MS = 2 * 60 * 1000;
+function stubDot(i) {
+  const startMs = now - (30 - i) * DOT_SPAN_MS;
+  const shape = i === 5 ? { ok: 100, fail: 1, status: "ok" }
+    : i === 11 ? { ok: 19, fail: 1, status: "degraded" }
+    : i === 17 ? { ok: 1, fail: 1, status: "outage" }
+    : i % 3 === 0 ? { ok: 2, fail: 0, status: "ok" }
+    : { ok: 0, fail: 0, status: "empty" };
+  const total = shape.ok + shape.fail;
+  return {
+    startMs,
+    spanMs: DOT_SPAN_MS,
+    ok: shape.ok,
+    fail: shape.fail,
+    rate: total > 0 ? shape.ok / total : null,
+    status: shape.status
+  };
+}
+const statsDots = Array.from({ length: 30 }, (_v, i) => stubDot(i));
+const statsSampled = statsDots.filter((d) => d.status !== "empty").length;
+const statsJson = {
+  ok: true,
+  persisted: true,
+  startedAt: now - 42 * 60 * 1000,
+  total: 468,
+  succeeded: 467,
+  failed: 1,
+  rate: 467 / 468,
+  recent: 25,
+  recentMs: 30 * 60 * 1000,
+  // 其中 2 个仍在流式输出：宿主把在途数一起算进 recent，口径才与 total 一致。
+  inflight: 2,
+  windowMs: 42 * 60 * 1000,
+  windowRate: 0.97,
+  windowSampledDots: statsSampled,
+  dotSpanMs: DOT_SPAN_MS,
+  dots: statsDots
+};
+
 async function main() {
   const dom = new JSDOM("<!doctype html><html><body><div id='root'></div></body></html>", {
     url: "http://127.0.0.1:3080/",
@@ -102,6 +147,9 @@ async function main() {
     }
     if (u.startsWith("/ark-quota/settings") && method === "POST") {
       return { json: async () => ({ ok: true, configured: true, refreshMs: JSON.parse(opts.body).refreshMs }) };
+    }
+    if (u.startsWith("/ark-quota/stats")) {
+      return { json: async () => ({ ...statsJson }) };
     }
     if (u.startsWith("/ark-quota")) {
       return { json: async () => ({ ...quotaJson }) };
@@ -144,6 +192,60 @@ async function main() {
   const footerSpacer = [...mount.querySelectorAll("span")].some((s) => /flex:\s*1/.test(s.getAttribute("style") || ""));
   assert(footerSpacer, "footer pushes the update time to the right");
 
+  // 统计区：三列数字 + 健康条（数据来自 /ark-quota/stats）。
+  await waitFor(() => mount.textContent.includes("请求总数"));
+  assert(mount.textContent.includes("468"), "stats shows the total request count");
+  assert(mount.textContent.includes("请求总数"), "stats labels the total column");
+  assert(mount.textContent.includes("成功率"), "stats labels the success-rate column");
+  assert(mount.textContent.includes("近 30 分钟"), "stats labels the recent-window column");
+  assert(mount.textContent.includes("25"), "stats shows the recent count");
+  // 口径说明挂在三列的 title 上：解释"总数为什么可能比已结束的多"。
+  const colTip = (kw) => [...mount.querySelectorAll("div")]
+    .map((d) => d.getAttribute("title") || "")
+    .find((t) => t.includes(kw)) || "";
+  assert(/请求发出即计数/.test(colTip("请求发出即计数")), "total column explains it counts at request start");
+  assert(/已结束的请求数/.test(colTip("已结束的请求数")), "success-rate column excludes in-flight requests");
+  const recentTip = colTip("近 30 分钟发起的请求数");
+  assert(recentTip.length > 0, "recent column has a tooltip");
+  assert(/其中 2 个仍在进行中/.test(recentTip), "recent tooltip discloses the in-flight count");
+  // 467/468 = 99.8%，四舍五入到一位小数，不能显示成 100%
+  assert(mount.textContent.includes("99.8%"), "success rate rounds to one decimal (99.8%)");
+  assert(mount.textContent.includes("健康"), "health strip is labelled");
+  // 窗口收窄到会话尺度（分钟级），不再是 4 小时
+  assert(/最近 42 分钟/.test(mount.textContent), "health window shows the session-scale span (42 分钟)");
+  assert(!/小时/.test(mount.textContent), "health window no longer spans hours");
+
+  // 30 个格：每个是带 title 的 span，颜色由宿主给的 status 分档决定
+  const dots = [...mount.querySelectorAll("span")].filter((s) => /→/.test(s.getAttribute("title") || ""));
+  assert(dots.length === 30, "health strip renders 30 cells");
+  const styleOf = (d) => d.getAttribute("style") || "";
+  const isGreen = (s) => /#46a758|rgb\(70, 167, 88\)/i.test(s);
+  const isOrangeDot = (s) => /#f5a524|rgb\(245, 165, 36\)/i.test(s);
+  const isRed = (s) => /#e5484d|rgb\(229, 72, 77\)/i.test(s);
+  const greenDots = dots.filter((d) => isGreen(styleOf(d)));
+  const orangeDots = dots.filter((d) => isOrangeDot(styleOf(d)));
+  const redDots = dots.filter((d) => isRed(styleOf(d)));
+  assert(greenDots.length > 0, "operational cells render green");
+  assert(orangeDots.length === 1, "the degraded cell (95%) renders orange");
+  assert(redDots.length === 1, "the outage cell (50%) renders red");
+
+  // 核心回归：100 成功 / 1 失败 = 99% 必须是绿色。
+  // 旧实现按 fail>0 一律标红，把 99% 和 0% 画成同一个颜色。
+  const highVolumeDot = dots.find((d) => /成功 100 · 失败 1/.test(d.getAttribute("title")));
+  assert(!!highVolumeDot, "the 100/1 cell is present");
+  assert(isGreen(styleOf(highVolumeDot)), "99% success stays green (not red on any failure)");
+  assert(!isRed(styleOf(highVolumeDot)), "a single failure among 100 does not paint the cell red");
+
+  // tooltip 以成功率为主角，不只是计数
+  assert(/成功率 99%/.test(highVolumeDot.getAttribute("title")), "cell tooltip leads with the success rate");
+  assert(/正常/.test(highVolumeDot.getAttribute("title")), "cell tooltip names the status band");
+  assert(/故障/.test(redDots[0].getAttribute("title")), "outage cell tooltip names its band");
+  assert(/成功率 50%/.test(redDots[0].getAttribute("title")), "outage cell tooltip carries its rate");
+  // 空格明确标注为无请求，不能被误读成故障
+  const emptyDot = dots.find((d) => /无请求/.test(d.getAttribute("title")));
+  assert(!!emptyDot, "cells without samples are labelled 无请求");
+  assert(!isRed(styleOf(emptyDot)) && !isGreen(styleOf(emptyDot)), "empty cells are neutral, not red or green");
+
   // 进度条：填充宽度 = 已用百分比，颜色按阈值切换（40% → 绿色系，同色系浅→深）。
   // jsdom 经 CSSOM 重新序列化 style，hex 会变成 rgb()，两种形式都接受。
   await waitFor(() => [...mount.querySelectorAll("div")].some((d) => /linear-gradient/.test(d.getAttribute("style") || "")));
@@ -176,6 +278,7 @@ async function main() {
     if (u.startsWith("/ark-quota/settings") && method === "POST") {
       return { json: async () => ({ ok: true, configured: true, refreshMs: JSON.parse(opts.body).refreshMs }) };
     }
+    if (u.startsWith("/ark-quota/stats")) return { json: async () => ({ ...statsJson }) };
     if (u.startsWith("/ark-quota")) return { json: async () => ({ ...quota62 }) };
     throw new Error("unexpected fetch " + u);
   };
@@ -210,6 +313,26 @@ async function main() {
   await waitFor(() => mount.textContent.includes("已保存并热生效"));
   const refreshSelectAfter = [...mount.querySelectorAll("select")].find((s) => String(s.value) === "600000");
   assert(!!refreshSelectAfter, "credentials save keeps refreshMs selected (does not drop to undefined)");
+
+  // 降级：旧宿主没有 /ark-quota/stats（404），统计区必须整段消失，卡片其余部分照常。
+  window.fetch = async (url, opts = {}) => {
+    const u = String(url);
+    const method = (opts.method || "GET").toUpperCase();
+    if (u.startsWith("/ark-quota/stats")) return { status: 404, json: async () => ({}) };
+    if (u.startsWith("/ark-quota/status")) return { json: async () => ({ ...statusJson }) };
+    if (u.startsWith("/ark-quota/credentials") && method === "POST") {
+      return { json: async () => ({ ok: true, configured: true, refreshMs: 600000 }) };
+    }
+    if (u.startsWith("/ark-quota")) return { json: async () => ({ ...quotaJson }) };
+    throw new Error("unexpected fetch " + u);
+  };
+  globalThis.fetch = window.fetch;
+  rootApi.render(React.createElement(Widget, { wide: true, key: "no-stats" }));
+  await waitFor(() => mount.textContent.includes("方舟额度"));
+  await new Promise((r) => setTimeout(r, 60));
+  assert(!mount.textContent.includes("请求总数"), "missing stats route hides the stats summary");
+  assert(!mount.textContent.includes("健康"), "missing stats route hides the health strip");
+  assert(mount.textContent.includes("方舟额度"), "quota card still renders without stats");
 
   rootApi.unmount();
   if (failed) {

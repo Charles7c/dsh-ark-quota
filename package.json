@@ -33,7 +33,8 @@
     }
   },
   "dependencies": {
-    "@deepseek-ai/schemastery": "^3.18.1"
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "zod": "^4.5.4"
   },
   "license": "MIT"
 }
