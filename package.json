@@ -1,7 +1,7 @@
 {
   "name": "dsh-ark-quota",
   "description": "火山方舟订阅套餐剩余额度侧边栏小组件：宿主半区代理控制台 GetCodingPlanUsage，浏览器半区渲染 footer 固定小组件",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "type": "module",
   "main": "lib/index.js",
@@ -33,7 +33,7 @@
     }
   },
   "dependencies": {
-    "@deepseek-ai/schemastery": "^3.18.1"
+    "@deepseek-ai/schemastery": "^3.18.2"
   },
   "license": "MIT"
 }
