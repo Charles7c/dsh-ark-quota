@@ -1,222 +1,182 @@
 #!/usr/bin/env node
 // Client-half smoke test. react / react-dom / jsdom are test-only — install
-// them into gitignored scratch-test/, never into package.json.
+// them into the gitignored scratch-test/ dir, never into package.json:
+//   mkdir -p scratch-test && cd scratch-test && npm i react react-dom jsdom
+// Run from the repo root:  node tools/smoke-client.mjs
 import { createRequire } from "node:module";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { readFile } from "node:fs/promises";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const scratch = join(root, "scratch-test");
 const scratchReq = existsSync(join(scratch, "node_modules", "react"))
   ? createRequire(join(scratch, "package.json"))
   : null;
-
 if (!scratchReq) {
-  console.error("scratch-test/node_modules/react missing; install react, react-dom, jsdom there (gitignored).");
+  console.error("scratch-test/node_modules/react 缺失；请在 scratch-test/ 里安装 react / react-dom / jsdom（该目录已被 gitignore）。");
   process.exit(1);
 }
 
 const React = scratchReq("react");
+const { createRoot } = scratchReq("react-dom/client");
 const { JSDOM } = scratchReq("jsdom");
 
 let failed = 0;
 function assert(cond, msg) {
-  if (!cond) {
-    failed += 1;
-    console.error("FAIL:", msg);
-  } else {
-    console.log("ok:", msg);
-  }
+  if (!cond) { failed += 1; console.error("FAIL:", msg); }
+  else console.log("ok:", msg);
 }
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function waitFor(fn, timeoutMs = 3000) {
-  const start = Date.now();
-  return new Promise((resolve, reject) => {
-    const tick = () => {
-      try {
-        const v = fn();
-        if (v) return resolve(v);
-      } catch {
-        // keep waiting
-      }
-      if (Date.now() - start > timeoutMs) return reject(new Error("waitFor timeout"));
-      setTimeout(tick, 20);
+// ── jsdom 环境 ───────────────────────────────────────────────
+const dom = new JSDOM("<!doctype html><body><div id='root'></div></body>", { url: "http://127.0.0.1:3080/" });
+globalThis.window = dom.window;
+globalThis.document = dom.window.document;
+
+// ── mock fetch ───────────────────────────────────────────────
+const calls = [];
+const nowSec = Math.floor(Date.now() / 1000);
+const accounts = [
+  { id: "company", label: "公司号", configured: true, providers: ["ark-coding-plan-company"] },
+  { id: "personal", label: "个人号", configured: true, providers: ["ark-coding-plan"] }
+];
+globalThis.fetch = async (url, opts) => {
+  const u = String(url);
+  calls.push(u);
+  let body = { ok: false };
+  if (u.startsWith("/ark-quota/stats")) {
+    body = { ok: false, code: "should-not-be-called" };
+  } else if (u.startsWith("/ark-quota/status")) {
+    body = { ok: true, configured: true, refreshMs: 300000, activeAccountId: "personal", accounts };
+  } else if (u.startsWith("/ark-quota/providers")) {
+    body = {
+      ok: true,
+      providers: [
+        { id: "ark-coding-plan", name: "火山Coding Plan" },
+        { id: "ark-coding-plan-company", name: "火山Agent Plan" }
+      ],
+      claimed: { "ark-coding-plan-company": "company", "ark-coding-plan": "personal", "deepseek-official": "company" },
+      foreignClaimed: [{ id: "deepseek-official", name: "DeepSeek", owner: "company" }],
+      filtered: 1
     };
-    tick();
-  });
-}
-
-const now = Date.now();
-const quotaJson = {
-  ok: true,
-  plan: "coding-plan",
-  status: "Normal",
-  updatedAt: Math.floor(now / 1000) - 600,
-  cachedAt: now,
-  refreshMs: 300000,
-  hasReward: false,
-  quota: [
-    { level: "monthly", percentUsed: 40, percentRemaining: 60, cap: 100, rewardTotalPercent: 0, resetAt: Math.floor(now / 1000) + 3600, used: 40, total: 100 }
-  ]
+  } else if (u.startsWith("/ark-quota/accounts")) {
+    body = { ok: true, accounts, activeAccountId: "personal", configured: true, refreshMs: 300000 };
+  } else if (u.startsWith("/ark-quota")) {
+    body = {
+      ok: true, plan: "coding-plan", refreshMs: 300000, cachedAt: Date.now(),
+      accountId: "personal", accounts, hasReward: true,
+      quota: [
+        // 99.9% 用例：绝不能显示成 100%
+        { level: "session", percentUsed: 99.9, percentRemaining: 0.1, resetAt: nowSec + 2 * 3600, used: null, total: null },
+        // 周档：撞线投影（>100%）→ 应出现「用完」结论
+        { level: "weekly", percentUsed: 80, percentRemaining: 20, resetAt: nowSec + 3 * 86400, used: null, total: null },
+        // 月档：安全投影
+        { level: "monthly", percentUsed: 23, percentRemaining: 77, resetAt: nowSec + 20 * 86400, used: null, total: null }
+      ],
+      burn: {
+        monthly: {
+          perDay: 3.2, budgetPerDay: 3.33, ratio: 0.96, status: "ok",
+          exhaustAt: Date.now() + 20 * 86400000,
+          projectedAtReset: 71, timeProgress: 0.23, quotaProgress: 0.23, sampleMs: 86400000
+        },
+        weekly: {
+          perDay: 40, budgetPerDay: 14.3, ratio: 2.8, status: "over",
+          exhaustAt: Date.now() + 12 * 3600000,
+          projectedAtReset: 130, timeProgress: 0.5, quotaProgress: 0.8, sampleMs: 12 * 3600000
+        }
+      }
+    };
+  }
+  return { json: async () => body, status: 200, ok: true };
 };
 
-const statusJson = { ok: true, configured: true, accessKeyIdSet: true, secretAccessKeySet: true, refreshMs: 600000 };
+// ── 加载 bundle ──────────────────────────────────────────────
+let captured = null;
+dom.window.__ModuleLoader__ = { load: (reg) => { captured = reg; } };
+const source = readFileSync(join(root, "lib", "client.js"), "utf8");
+(0, eval)(source);
+if (!captured) { console.error("bundle 没有注册工厂"); process.exit(1); }
+const mod = captured.factory((id) => {
+  if (id === "react") return React;
+  if (id === "react/jsx-runtime") return scratchReq("react/jsx-runtime");
+  throw new Error("unexpected require: " + id);
+});
 
-async function main() {
-  const dom = new JSDOM("<!doctype html><html><body><div id='root'></div></body></html>", {
-    url: "http://127.0.0.1:3080/",
-    pretendToBeVisual: true
-  });
-  const { window } = dom;
-  globalThis.window = window;
-  globalThis.document = window.document;
-  globalThis.HTMLElement = window.HTMLElement;
-  globalThis.Node = window.Node;
-  globalThis.Event = window.Event;
-  globalThis.MouseEvent = window.MouseEvent;
-  const { createRoot } = scratchReq("react-dom/client");
-
-  let factory;
-  window.__ModuleLoader__ = {
-    load({ factory: f }) { factory = f; }
-  };
-  const src = await readFile(join(root, "lib/client.js"), "utf8");
-  const run = new Function("window", src);
-  run(window);
-  const mod = factory((id) => {
-    if (id === "react") return React;
-    if (id === "react/jsx-runtime") return scratchReq("react/jsx-runtime");
-    throw new Error("unexpected require: " + id);
-  });
-
-  window.fetch = async (url, opts = {}) => {
-    const u = String(url);
-    const method = (opts.method || "GET").toUpperCase();
-    if (u.startsWith("/ark-quota/status")) {
-      return { json: async () => ({ ...statusJson }) };
-    }
-    if (u.startsWith("/ark-quota/credentials") && method === "POST") {
-      return { json: async () => ({ ok: true, configured: true, refreshMs: 600000 }) };
-    }
-    if (u.startsWith("/ark-quota/settings") && method === "POST") {
-      return { json: async () => ({ ok: true, configured: true, refreshMs: JSON.parse(opts.body).refreshMs }) };
-    }
-    if (u.startsWith("/ark-quota")) {
-      return { json: async () => ({ ...quotaJson }) };
-    }
-    throw new Error("unexpected fetch " + u);
-  };
-  globalThis.fetch = window.fetch;
-
-  let Widget;
-  let Settings;
-  const ctx = {
-    slots: {
-      inject(_name, fn) { return fn(); },
-      register(meta, Component) {
-        if (meta.name === "sidebar.footer.action") Widget = Component;
-        if (meta.name === "settings.section") Settings = Component;
-        return () => {};
-      }
-    }
-  };
-  mod.apply(ctx);
-
-  // Wide card: relative time must follow cachedAt (just now), not updatedAt (10 min ago).
-  const mount = window.document.getElementById("root");
-  const rootApi = createRoot(mount);
-  rootApi.render(React.createElement(Widget, { wide: true }));
-  await waitFor(() => mount.textContent.includes("刚刚更新"));
-  assert(mount.textContent.includes("刚刚更新"), "footer uses cachedAt → 刚刚更新");
-  assert(!mount.textContent.includes("10 分钟前更新"), "footer does not use stale updatedAt");
-  // 刷新节奏不再占版面：完整文案挂在刷新按钮的 title 上。
-  const refreshBtn = [...mount.querySelectorAll("button")].find((b) => /立即刷新/.test(b.getAttribute("title") || ""));
-  assert(!!refreshBtn, "refresh button is present");
-  assert(/每 5 分钟自动刷新/.test(refreshBtn.getAttribute("title")), "cadence lives on the refresh button title");
-  assert(!/5 分钟/.test(mount.textContent), "cadence text no longer occupies the card body");
-  // 显示模式胶囊常驻头部，明示当前看的是已用还是剩余。
-  const pill = [...mount.querySelectorAll("button")].find((b) => /^(已用|剩余)$/.test(b.textContent.trim()));
-  assert(!!pill, "display-mode pill is present in the header");
-  assert(pill.textContent.trim() === "已用", "pill reflects the default used mode");
-  // 更新时间靠右下角：它和奖励徽章之间有一个弹性占位。
-  const footerSpacer = [...mount.querySelectorAll("span")].some((s) => /flex:\s*1/.test(s.getAttribute("style") || ""));
-  assert(footerSpacer, "footer pushes the update time to the right");
-
-  // 进度条：填充宽度 = 已用百分比，颜色按阈值切换（40% → 绿色系，同色系浅→深）。
-  // jsdom 经 CSSOM 重新序列化 style，hex 会变成 rgb()，两种形式都接受。
-  await waitFor(() => [...mount.querySelectorAll("div")].some((d) => /linear-gradient/.test(d.getAttribute("style") || "")));
-  const styles = [...mount.querySelectorAll("div")].map((d) => d.getAttribute("style") || "");
-  const fill = styles.find((s) => /linear-gradient/.test(s));
-  assert(!!fill, "progress bar fill is present");
-  // 40% 已用 → 填充宽 40%
-  assert(/width:\s*40%/.test(fill), "fill width equals used percent (40%)");
-  // 绿色系两个色标：#63c07c → #46a758
-  assert(
-    /(#63c07c|rgb\(99, 192, 124\))/i.test(fill) && /(#46a758|rgb\(70, 167, 88\))/i.test(fill),
-    "low-usage fill stays in the green hue (no rainbow band)"
-  );
-  // 不能出现跨色系的黄/红色标（那是彩带写法的特征）。
-  assert(!/(#f5c518|#e5484d|rgb\(245, 197, 24\)|rgb\(229, 72, 77\))/i.test(fill), "fill has no cross-hue stops");
-  // 轨道底色：同色系淡色（40% → 绿色 18% 透明度），而不是灰底。
-  const trackStyle = styles.find((s) => /rgba\(70, 167, 88, 0\.18\)/.test(s));
-  assert(!!trackStyle, "track uses a translucent same-hue tint (green at 40%)");
-  assert(!/--dsw-alias-track-bg/.test(trackStyle), "track no longer falls back to the grey theme token");
-
-  // 阈值回归：62% 已用必须进入橙色档（50~80%），不能还是绿色。
-  const quota62 = { ...quotaJson, quota: [{ ...quotaJson.quota[0], percentUsed: 62, percentRemaining: 38, used: 62 }] };
-  window.fetch = async (url, opts = {}) => {
-    const u = String(url);
-    const method = (opts.method || "GET").toUpperCase();
-    if (u.startsWith("/ark-quota/status")) return { json: async () => ({ ...statusJson }) };
-    if (u.startsWith("/ark-quota/credentials") && method === "POST") {
-      return { json: async () => ({ ok: true, configured: true, refreshMs: 600000 }) };
-    }
-    if (u.startsWith("/ark-quota/settings") && method === "POST") {
-      return { json: async () => ({ ok: true, configured: true, refreshMs: JSON.parse(opts.body).refreshMs }) };
-    }
-    if (u.startsWith("/ark-quota")) return { json: async () => ({ ...quota62 }) };
-    throw new Error("unexpected fetch " + u);
-  };
-  globalThis.fetch = window.fetch;
-  rootApi.render(React.createElement(Widget, { wide: true, key: "bar62" }));
-  const isOrange = (s) => /#ffc95c|#f5a524|rgb\(255, 201, 92\)|rgb\(245, 165, 36\)/i.test(s);
-  await waitFor(() => [...mount.querySelectorAll("div")].some((d) => isOrange(d.getAttribute("style") || "")));
-  const fill62 = [...mount.querySelectorAll("div")].map((d) => d.getAttribute("style") || "").find((s) => /linear-gradient/.test(s));
-  assert(isOrange(fill62), "62% used fills orange (50% threshold, not green)");
-  assert(!/#63c07c|#46a758|rgb\(99, 192, 124\)|rgb\(70, 167, 88\)/i.test(fill62), "62% used shows no green stop");
-
-  // Settings: save credentials must keep refreshMs on the select.
-  rootApi.render(React.createElement(Settings, {}));
-  await waitFor(() => mount.querySelector("select") && mount.querySelectorAll("select").length >= 2);
-  const refreshSelect = [...mount.querySelectorAll("select")].find((s) => s.value === "600000");
-  assert(!!refreshSelect, "status refreshMs=600000 is selected");
-  const inputs = mount.querySelectorAll("input");
-  const ak = inputs[0];
-  const sk = inputs[1];
-  function changeInput(el, value) {
-    const tracker = el._valueTracker;
-    if (tracker) tracker.setValue("");
-    const setNative = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-    setNative.call(el, value);
-    el.dispatchEvent(new window.Event("input", { bubbles: true }));
-    el.dispatchEvent(new window.Event("change", { bubbles: true }));
+// ── 捕获 slot 注册 ───────────────────────────────────────────
+const slots = new Map();
+mod.apply({
+  slots: {
+    inject: (name, cb) => { slots.set(name, cb()); },
+    register: (desc, Component) => ({ desc, Component })
   }
-  changeInput(ak, "test-ak-id");
-  changeInput(sk, "test-sk");
-  const saveBtn = [...mount.querySelectorAll("button")].find((b) => /保存访问密钥/.test(b.textContent));
-  saveBtn.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
-  await waitFor(() => mount.textContent.includes("已保存并热生效"));
-  const refreshSelectAfter = [...mount.querySelectorAll("select")].find((s) => String(s.value) === "600000");
-  assert(!!refreshSelectAfter, "credentials save keeps refreshMs selected (does not drop to undefined)");
+});
+const widgetReg = [...slots.values()].find((r) => r.desc.id === "ark-quota" && r.desc.name === "sidebar.footer.action");
+const settingsReg = [...slots.values()].find((r) => r.desc.id === "ark-quota" && r.desc.name === "settings.section");
+if (!widgetReg || !settingsReg) { console.error("slot 注册缺失：", [...slots.keys()]); process.exit(1); }
 
-  rootApi.unmount();
-  if (failed) {
-    console.error(`\n${failed} assertion(s) failed`);
-    process.exit(1);
-  }
-  console.log("\nsmoke-client: all passed");
-}
+// ── 挂载 ─────────────────────────────────────────────────────
+const rootEl = document.getElementById("root");
+const root2 = createRoot(rootEl);
+root2.render(React.createElement(
+  "div", null,
+  React.createElement("div", { id: "wide" }, React.createElement(widgetReg.Component, { wide: true })),
+  React.createElement("div", { id: "rail" }, React.createElement(widgetReg.Component, { wide: false })),
+  React.createElement("div", { id: "settings" }, React.createElement(settingsReg.Component, {}))
+));
 
-await main();
+await wait(500);
+
+const wideEl = document.getElementById("wide");
+const wide = wideEl.textContent;
+const rail = document.getElementById("rail").textContent;
+const settings = document.getElementById("settings").textContent;
+
+// 宽卡：核心内容
+assert(wide.includes("方舟额度"), "宽卡渲染标题");
+assert(wide.includes("5小时") && wide.includes("近1周") && wide.includes("近1月"), "宽卡渲染三档额度");
+assert(wide.includes("Coding Plan"), "底部信息行有套餐徽章");
+assert(wide.includes("含奖励额度"), "hasReward 时显示含奖励额度");
+assert(wide.includes("分钟前更新") || wide.includes("刚刚更新"), "显示更新时间");
+
+// 99.9% 不得显示成 100%
+assert(!wide.includes("100%"), "99.9% 没有被四舍五入成 100%");
+assert(wide.includes("99.9%"), "99.9% 保留一位小数显示");
+
+// 耗尽预测结论行
+assert(wide.includes("重置时预计用到") && wide.includes("够用"), "月档安全投影给出「够用」结论");
+assert(wide.includes("用完"), "周档撞线投影给出「用完」结论");
+
+// 账号切换器：头部 <select>，多账号
+const selects = wideEl.querySelectorAll("select");
+assert(selects.length >= 1, "头部渲染账号下拉 <select>");
+const opts = [...(selects[0]?.querySelectorAll("option") || [])].map((o) => o.textContent);
+assert(opts.some((t) => t.includes("公司号")) && opts.some((t) => t.includes("个人号")), "下拉含两个账号选项");
+
+// 已移除的 stats / 显示模式
+assert(!wide.includes("请求总数"), "不再显示请求总数");
+assert(!wide.includes("成功率"), "不再显示成功率");
+assert(!wide.includes("健康"), "不再显示健康条");
+assert(!/已用|剩余/.test(wide.replace(/已用百分比|近1月已用/g, "")), "头部没有已用/剩余切换胶囊");
+assert(!wide.includes("个提供方"), "底部不再显示 N 个提供方");
+
+// rail 药丸：近1月已用百分比
+assert(/\d+%/.test(rail), "rail 药丸显示百分比");
+assert(!rail.includes("100%"), "rail 药丸不出现 100%");
+
+// 设置页
+assert(settings.includes("AccessKey"), "设置页有 AK/SK 输入");
+assert(settings.includes("刷新频率"), "设置页有刷新频率");
+assert(settings.includes("deepseek-official"), "设置页显示误关联警告");
+assert(!settings.includes("显示方式"), "设置页没有已移除的显示方式项");
+// 防自动填充诱饵
+assert(!!document.querySelector('input[name="ark-decoy-username"]'), "存在防填充诱饵用户名框");
+assert(!!document.querySelector('input[name="ark-decoy-password"]'), "存在防填充诱饵密码框");
+
+// 网络：从未请求 /ark-quota/stats
+const statsCalls = calls.filter((u) => u.startsWith("/ark-quota/stats"));
+assert(statsCalls.length === 0, "客户端不再请求 /ark-quota/stats（实际 " + statsCalls.length + " 次）");
+
+console.log("\nfetch 调用：", [...new Set(calls)].join(", "));
+// React 的轮询 setTimeout / useNow setInterval 会让事件循环不空，必须显式退出。
+process.exit(failed > 0 ? 1 : 0);

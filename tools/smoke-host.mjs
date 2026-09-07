@@ -1,7 +1,28 @@
 #!/usr/bin/env node
-// Host-half smoke test: mock ctx + stub fetch, no listening server.
+// 宿主侧冒烟测试：mock ctx + stub fetch，不起监听服务器。
+//
+// 本轮重构后插件只保留「额度快照 + burn 消耗速度预测」，整套请求统计
+// （foldStats/shapeStats/健康点状图/token/llm-stream 钩子、/ark-quota/stats
+// 路由）已移除。本文件只测试仍存在的导出与路由。
 import { Readable } from "node:stream";
-import { apply, normalizeRefreshMs, ALLOWED_REFRESH_MS } from "../lib/index.js";
+import {
+  apply,
+  normalizeRefreshMs,
+  ALLOWED_REFRESH_MS,
+  migrateAccounts,
+  resolveActiveAccountId,
+  migrateStatsState,
+  snapshotStatsState,
+  mergeStatsState,
+  isArkProvider,
+  foldSnap,
+  foldSnapFor,
+  pruneSnaps,
+  burnRate,
+  burnRatesFor,
+  ACCOUNT_ID_RE,
+  LEGACY_ACCOUNT_ID
+} from "../lib/index.js";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -36,10 +57,50 @@ function makeRes() {
   };
 }
 
-function mockCtx() {
+// mock 的 llm 提供方路由清单：两个火山方舟路由 + 一个内置 deepseek 直连
+// （无 baseURL，走名称判定）+ 一个第三方中转（非方舟域名）。
+const DEFAULT_PROVIDERS = [
+  { id: "ark-coding-plan", name: "火山 Coding Plan" },
+  { id: "ark-coding-plan-company", name: "火山 Agent Plan" },
+  { id: "deepseek-official", name: "DeepSeek" },
+  { id: "newapi-mo", name: "第三方中转" }
+];
+
+function mockCtx(opts = {}) {
   const routes = new Map();
-  return {
-    logger: { info() {}, warn() {} },
+  let stored = opts.stored === undefined ? null : opts.stored;
+  let openedSpec = null;
+  // 与 dsh-storage 的 UNIT_NAME_RE 保持一致：域名含连字符会被拒，
+  // open() 抛错后插件静默退回内存态，重启快照历史全丢。
+  const UNIT_NAME_RE = /^[a-z][a-z0-9_]*$/;
+  const storageDomain = {
+    async open(spec) {
+      if (!UNIT_NAME_RE.test(spec.name)) {
+        throw new Error(`invalid-name: domain '${spec.name}' must match ${UNIT_NAME_RE}`);
+      }
+      for (const table of Object.keys(spec.tables || {})) {
+        if (!UNIT_NAME_RE.test(table)) {
+          throw new Error(`invalid-name: table '${table}' must match ${UNIT_NAME_RE}`);
+        }
+      }
+      // 全局 schema 不得接受 null（storage-domain 的硬约束）。
+      if (spec.global !== undefined && spec.global.schema.safeParse(null).success) {
+        throw new Error("global schema must not accept null");
+      }
+      openedSpec = spec;
+      if (stored === null) stored = spec.global.initial;
+      return {
+        name: spec.name,
+        global: {
+          get() { return stored; },
+          async set(v) { stored = v; }
+        },
+        async close() {}
+      };
+    }
+  };
+  const ctx = {
+    logger: { info() {}, warn() {}, error() {} },
     effect(fn) { fn(); },
     webServer: {
       register(route) {
@@ -62,15 +123,68 @@ function mockCtx() {
             for (const w of watchers) w();
           }
         };
+      },
+      // 别的插件的命名空间：/ark-quota/providers 读它拿 baseURL 判定方舟路由。
+      // opts.otherSettings === false 时模拟"读不到"，验证名称特征兜底路径。
+      get: (ns) => {
+        if (opts.otherSettings === false) return undefined;
+        if (ns !== "llm-pi-ai") return undefined;
+        return opts.otherSettings ?? {
+          providers: {
+            "ark-coding-plan": { baseURL: "https://ark.cn-beijing.volces.com/api/coding/v3" },
+            "ark-coding-plan-company": { baseURL: "https://ark.cn-beijing.volces.com/api/plan/v3" },
+            "newapi-mo": { baseURL: "https://sub2api.example.invalid" }
+            // 注意：deepseek-official 是内置 deepseek 适配器路由，这里不给
+            // baseURL，强制走名称特征判定（应判为非方舟）。
+          }
+        };
       }
     },
-    __routes: routes
+    storageDomain: opts.storageDomain === false ? undefined : storageDomain,
+    llm: opts.llm === false ? undefined : {
+      listProviders: () => opts.providers ?? DEFAULT_PROVIDERS,
+      // 适配器自注册的可配置目录：本测试用命名空间扫描路径兜底，返回空即可。
+      listConfigurableProviders: () => []
+    },
+    __routes: routes,
+    __openedSpec: () => openedSpec,
+    __stored: () => stored
+  };
+  return ctx;
+}
+
+/** 多账号配置：两个火山账号，各关联一个方舟路由。 */
+function multiConfig(extra = {}) {
+  return {
+    accounts: [
+      {
+        id: "personal",
+        label: "个人 Pro",
+        accessKeyId: "ak-personal",
+        secretAccessKey: "sk-personal",
+        region: "cn-beijing",
+        version: "2024-01-01",
+        providers: ["ark-coding-plan"]
+      },
+      {
+        id: "company",
+        label: "公司 Agent Plan",
+        accessKeyId: "ak-company",
+        secretAccessKey: "sk-company",
+        region: "cn-beijing",
+        version: "2024-01-01",
+        providers: ["ark-coding-plan-company"]
+      }
+    ],
+    activeAccountId: "company",
+    refreshMs: 300000,
+    ...extra
   };
 }
 
 async function call(ctx, path, method, url, json) {
   const route = ctx.__routes.get(path);
-  if (!route) throw new Error(`missing route ${path}`);
+  if (!route) return { res: { statusCode: 404 }, json: null, __missing: true };
   const req = makeReq(method, url ?? path, json);
   const res = makeRes();
   await route.handler(req, res);
@@ -93,162 +207,517 @@ const codingBody = {
 };
 
 // --- normalizeRefreshMs ---
-assert(normalizeRefreshMs(300000) === 300000, "exact 5min cadence passes through");
-assert(normalizeRefreshMs(1000) === 60000, "1s YAML snaps to 1min, not an upstream hammer");
-assert(normalizeRefreshMs(120000) === 60000, "2min snaps to nearest allowlisted 1min");
-assert(normalizeRefreshMs(NaN) === 300000, "NaN falls back to default 5min");
-assert(ALLOWED_REFRESH_MS.length === 5, "allowlist has five UI choices");
+assert(normalizeRefreshMs(300000) === 300000, "合法值 5 分钟透传");
+assert(normalizeRefreshMs(1000) === 60000, "1s 的 YAML 笔误 snap 到 1 分钟，不会打爆上游");
+assert(normalizeRefreshMs(120000) === 60000, "2 分钟 snap 到最近的合法值 1 分钟");
+assert(normalizeRefreshMs(NaN) === 300000, "NaN 回落到默认 5 分钟");
+assert(normalizeRefreshMs(-5) === 300000, "负数回落到默认 5 分钟");
+assert(ALLOWED_REFRESH_MS.length === 5, "刷新档位共 5 个");
 
-// --- missing keys ---
+// --- 缺密钥 → 401 missing-auth ---
 {
   const ctx = mockCtx();
   apply(ctx, { accessKeyId: "", secretAccessKey: "", region: "cn-beijing", version: "2024-01-01", refreshMs: 300000 });
   const { res, json } = await call(ctx, "/ark-quota", "GET", "/ark-quota");
-  assert(res.statusCode === 401 && json.code === "missing-auth", "missing keys → 401 missing-auth");
-  assert(!Object.prototype.hasOwnProperty.call(json, "secretAccessKey"), "error body has no secretAccessKey field");
+  assert(res.statusCode === 401 && json.code === "missing-auth", "缺密钥 → 401 missing-auth");
+  assert(!Object.prototype.hasOwnProperty.call(json, "secretAccessKey"), "错误体不含 secretAccessKey 字段");
 }
 
-// --- /ark-quota/settings allowlist ---
+// --- /ark-quota/settings 的 refreshMs allowlist ---
 {
   const ctx = mockCtx();
   apply(ctx, { accessKeyId: "", secretAccessKey: "", region: "cn-beijing", version: "2024-01-01", refreshMs: 1000 });
   const snapped = await call(ctx, "/ark-quota/status", "GET", "/ark-quota/status");
-  assert(snapped.json.refreshMs === 60000, "apply() snaps refreshMs=1000 → 60000 in status");
+  assert(snapped.json.refreshMs === 60000, "apply() 把 refreshMs=1000 snap 成 60000");
   const get = await call(ctx, "/ark-quota/settings", "GET", "/ark-quota/settings");
   assert(get.res.statusCode === 405, "GET /ark-quota/settings → 405");
   const bad = await call(ctx, "/ark-quota/settings", "POST", "/ark-quota/settings", { refreshMs: 1000 });
-  assert(bad.res.statusCode === 400 && bad.json.code === "bad-value", "POST refreshMs=1000 rejected");
-  const extra = await call(ctx, "/ark-quota/settings", "POST", "/ark-quota/settings", { refreshMs: 60000, accessKeyId: "nope" });
-  assert(extra.res.statusCode === 200 && extra.json.refreshMs === 60000, "POST 1min accepted; extra fields ignored");
-  assert(extra.json.accessKeyIdSet === false, "settings route does not echo/set keys");
+  assert(bad.res.statusCode === 400 && bad.json.code === "bad-value", "非法 refreshMs=1000 被拒 → 400");
+  const ok = await call(ctx, "/ark-quota/settings", "POST", "/ark-quota/settings", { refreshMs: 60000, accessKeyId: "nope" });
+  assert(ok.res.statusCode === 200 && ok.json.refreshMs === 60000, "合法 1 分钟被接受，多余字段忽略");
+  assert(ok.json.accessKeyIdSet === false, "settings 路由不回显/不落密钥");
   const status = await call(ctx, "/ark-quota/status", "GET", "/ark-quota/status");
-  assert(status.json.refreshMs === 60000, "status reflects snapped+saved refreshMs");
-  // config 1000 was snapped in apply() base before the POST
+  assert(status.json.refreshMs === 60000, "保存后 status 反映新 refreshMs");
 }
 
-// --- credentials save preserves refreshMs in statusPayload ---
+// --- /ark-quota/credentials：空 body 400、写入不回显 ---
 {
   const ctx = mockCtx();
-  apply(ctx, { accessKeyId: "", secretAccessKey: "", region: "cn-beijing", version: "2024-01-01", refreshMs: 1800000 });
+  apply(ctx, multiConfig());
+  const empty = await call(ctx, "/ark-quota/credentials", "POST", "/ark-quota/credentials", {});
+  assert(empty.res.statusCode === 400 && empty.json.code === "noop", "空 body / 无密钥字段 → 400 noop");
   const saved = await call(ctx, "/ark-quota/credentials", "POST", "/ark-quota/credentials", {
-    accessKeyId: "test-ak-id",
-    secretAccessKey: "test-sk"
+    account: "personal",
+    accessKeyId: "  ak-new  ",
+    secretAccessKey: "sk-new"
   });
-  assert(saved.res.statusCode === 200, "credentials POST 200");
-  assert(saved.json.configured === true, "configured true");
-  assert(saved.json.refreshMs === 1800000, "credentials response keeps refreshMs");
-  assert(saved.json.accessKeyId == null && saved.json.secretAccessKey == null, "no secret echo");
+  assert(saved.res.statusCode === 200, "指定账号写入密钥 200");
+  assert(saved.json.accounts.find((a) => a.id === "personal").configured === true, "目标账号变为已配置");
+  assert(!JSON.stringify(saved.json).includes("ak-new") && !JSON.stringify(saved.json).includes("sk-new"), "响应不回显任何密钥");
+  const ghost = await call(ctx, "/ark-quota/credentials", "POST", "/ark-quota/credentials", {
+    account: "ghost", accessKeyId: "a", secretAccessKey: "b"
+  });
+  assert(ghost.res.statusCode === 404, "写入未知账号 → 404");
+  // 一个账号都没有时自动建 default（首次配置顺手路径）
+  const fresh = mockCtx();
+  apply(fresh, { refreshMs: 300000 });
+  const first = await call(fresh, "/ark-quota/credentials", "POST", "/ark-quota/credentials", { accessKeyId: "ak", secretAccessKey: "sk" });
+  assert(first.res.statusCode === 200, "空配置下首次保存 200");
+  assert(first.json.accounts.length === 1 && first.json.accounts[0].id === LEGACY_ACCOUNT_ID, "空配置自动创建 default 账号");
 }
 
-// --- quota payload: clamp + cachedAt ms + cache ---
+// --- 配额 payload：clamp + cachedAt 毫秒 + 缓存命中不重复打上游 ---
 {
   let fetches = 0;
   const orig = globalThis.fetch;
   globalThis.fetch = async () => {
     fetches += 1;
-    return {
-      status: 200,
-      async text() { return JSON.stringify(codingBody); }
-    };
+    return { status: 200, async text() { return JSON.stringify(codingBody); } };
   };
   try {
     const ctx = mockCtx();
     apply(ctx, {
-      accessKeyId: "test-ak-id",
-      secretAccessKey: "test-sk",
-      region: "cn-beijing",
-      version: "2024-01-01",
-      refreshMs: 300000
+      accessKeyId: "test-ak-id", secretAccessKey: "test-sk",
+      region: "cn-beijing", version: "2024-01-01", refreshMs: 300000
     });
     const first = await call(ctx, "/ark-quota", "GET", "/ark-quota");
-    assert(first.res.statusCode === 200 && first.json.ok === true, "quota GET 200");
+    assert(first.res.statusCode === 200 && first.json.ok === true, "额度查询 200");
     const monthly = first.json.quota.find((q) => q.level === "monthly");
     const weekly = first.json.quota.find((q) => q.level === "weekly");
-    assert(monthly.percentUsed === 100, "percentUsed clamped to 100");
-    assert(monthly.percentRemaining === 0, "percentRemaining follows clamped used");
-    assert(weekly.percentUsed === 0, "negative percentUsed clamped to 0");
-    assert(typeof first.json.cachedAt === "number" && first.json.cachedAt > 1e12, "cachedAt is epoch milliseconds");
-    assert(first.json.refreshMs === 300000, "payload.refreshMs is allowlisted");
+    assert(monthly.percentUsed === 100, "percentUsed 超过 100 被 clamp 到 100");
+    assert(monthly.percentRemaining === 0, "percentRemaining 跟随 clamp 后的已用");
+    assert(weekly.percentUsed === 0, "负数 percentUsed 被 clamp 到 0");
+    assert(typeof first.json.cachedAt === "number" && first.json.cachedAt > 1e12, "cachedAt 是毫秒级时间戳");
+    assert(first.json.refreshMs === 300000, "payload.refreshMs 取自合法档位");
+    assert(typeof first.json.burn === "object" && first.json.burn !== null, "响应带 burn 字段");
     const head = await call(ctx, "/ark-quota", "HEAD", "/ark-quota");
-    assert(head.res.statusCode === 200 && head.res.body === "", "HEAD has no body");
+    assert(head.res.statusCode === 200 && head.res.body === "", "HEAD 无响应体");
     const second = await call(ctx, "/ark-quota", "GET", "/ark-quota");
-    assert(fetches === 1, "second GET served from cache (one upstream call)");
-    assert(second.json.cachedAt === first.json.cachedAt, "cached response keeps original cachedAt");
+    assert(fetches === 1, "第二次 GET 命中缓存，只打了一次上游");
+    assert(second.json.cachedAt === first.json.cachedAt, "缓存响应保留原始 cachedAt");
+    // force=1 强制刷新
+    await call(ctx, "/ark-quota", "GET", "/ark-quota?force=1");
+    assert(fetches === 2, "force=1 绕过缓存再打一次上游");
   } finally {
     globalThis.fetch = orig;
   }
 }
 
-// --- resetAt / updatedAt unit normalization ---
-// The console is not self-consistent: GetCodingPlanUsage returns epoch SECONDS
-// while GetAFPUsage returns MILLISECONDS. Feeding ms into the client's
-// seconds-based formatter rendered "20678903 天后重置", so toEpochSeconds()
-// pins the unit at the parse boundary.
+// --- 多账号：独立签名、独立缓存 ---
+{
+  const orig = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = async (_url, init) => {
+    const auth = String(init?.headers?.Authorization ?? init?.headers?.authorization ?? "");
+    const m = /Credential=([^/,\s]+)/.exec(auth);
+    seen.push(m === null ? "?" : m[1]);
+    return { status: 200, async text() { return JSON.stringify(codingBody); } };
+  };
+  try {
+    const ctx = mockCtx();
+    apply(ctx, multiConfig());
+    const dflt = await call(ctx, "/ark-quota", "GET", "/ark-quota");
+    assert(dflt.json.accountId === "company", "缺省取 activeAccountId=company");
+    assert(seen[0] === "ak-company", "company 用自己的 AK 签名");
+    assert(!JSON.stringify(dflt.json).includes("sk-company"), "响应不泄露密钥");
+    const personal = await call(ctx, "/ark-quota", "GET", "/ark-quota?account=personal");
+    assert(personal.json.accountId === "personal", "?account= 切到 personal");
+    assert(seen[1] === "ak-personal", "personal 用自己的 AK 签名（缓存不串账号）");
+    await call(ctx, "/ark-quota", "GET", "/ark-quota");
+    await call(ctx, "/ark-quota", "GET", "/ark-quota?account=personal");
+    assert(seen.length === 2, "两个账号各自命中缓存，不再打上游");
+    const ghost = await call(ctx, "/ark-quota", "GET", "/ark-quota?account=ghost");
+    assert(ghost.res.statusCode === 404 && ghost.json.code === "unknown-account", "未知账号 → 404");
+    const bare = mockCtx();
+    apply(bare, { refreshMs: 300000 });
+    const none = await call(bare, "/ark-quota", "GET", "/ark-quota");
+    assert(none.res.statusCode === 401 && none.json.code === "missing-auth", "一个账号都没配 → 401 missing-auth");
+    assert(Array.isArray(none.json.accounts) && none.json.accounts.length === 0, "无账号时 accounts 为空数组");
+  } finally {
+    globalThis.fetch = orig;
+  }
+}
+
+// --- resetAt / updatedAt 单位归一化（秒 vs 毫秒）---
 {
   const RESET_S = Math.floor(Date.now() / 1000) + 3 * 3600;
   const RESET_MS = RESET_S * 1000;
   const orig = globalThis.fetch;
-  const stub = (body) => {
-    globalThis.fetch = async () => ({ status: 200, async text() { return JSON.stringify(body); } });
-  };
   const creds = {
-    accessKeyId: "test-ak-id",
-    secretAccessKey: "test-sk",
-    region: "cn-beijing",
-    version: "2024-01-01",
-    refreshMs: 300000
+    accessKeyId: "test-ak-id", secretAccessKey: "test-sk",
+    region: "cn-beijing", version: "2024-01-01", refreshMs: 300000
   };
   const quotaOnce = async (body) => {
-    stub(body);
+    globalThis.fetch = async () => ({ status: 200, async text() { return JSON.stringify(body); } });
     const ctx = mockCtx();
     apply(ctx, creds);
     return (await call(ctx, "/ark-quota", "GET", "/ark-quota")).json;
   };
-
   try {
-    // Agent Plan: milliseconds upstream must land as seconds.
-    const afp = await quotaOnce({
-      Result: { AFPFiveHour: { Quota: 100, Used: 25, ResetTime: RESET_MS } }
-    });
+    // Agent Plan 上游给毫秒 → 归一化成秒
+    const afp = await quotaOnce({ Result: { AFPFiveHour: { Quota: 100, Used: 25, ResetTime: RESET_MS } } });
     const session = afp.quota.find((q) => q.level === "session");
-    assert(session.resetAt === RESET_S, "agent-plan ms ResetTime normalized to seconds");
+    assert(session.resetAt === RESET_S, "Agent Plan 毫秒 ResetTime 归一化为秒");
     const days = Math.floor((session.resetAt * 1000 - Date.now()) / 86400000);
-    assert(days === 0, "agent-plan reset is hours away, not ~20678903 days");
-
-    // Coding Plan: seconds upstream must pass through untouched.
-    const coding = await quotaOnce({
-      Result: { QuotaUsage: [{ Level: "weekly", Percent: 40, ResetTime: RESET_S }] } });
-    assert(coding.quota[0].resetAt === RESET_S, "coding-plan seconds ResetTime unchanged");
-
-    // The core invariant: the same instant in either unit agrees.
-    const asMs = await quotaOnce({
-      Result: { QuotaUsage: [{ Level: "weekly", Percent: 40, ResetTime: RESET_MS }] } });
-    assert(asMs.quota[0].resetAt === coding.quota[0].resetAt, "either unit → identical resetAt");
-
-    // Absent/zero/non-numeric must stay null (never a 1970 fallback).
+    assert(days === 0, "重置时间在几小时后，而不是 20678903 天后");
+    // Coding Plan 上游给秒 → 原样保留
+    const coding = await quotaOnce({ Result: { QuotaUsage: [{ Level: "weekly", Percent: 40, ResetTime: RESET_S }] } });
+    assert(coding.quota[0].resetAt === RESET_S, "Coding Plan 秒级 ResetTime 不变");
+    // 同一时刻两种单位结果一致
+    const asMs = await quotaOnce({ Result: { QuotaUsage: [{ Level: "weekly", Percent: 40, ResetTime: RESET_MS }] } });
+    assert(asMs.quota[0].resetAt === coding.quota[0].resetAt, "秒/毫秒两种输入得到相同 resetAt");
+    // 缺失/0/非数字 → null，绝不回落到 1970
     const junk = await quotaOnce({
       Result: { QuotaUsage: [
         { Level: "weekly", Percent: 40 },
-        { Level: "monthly", Percent: 10, ResetTime: 0 },
-        { Level: "session", Percent: 10, ResetTime: "soon" }
+        { Level: "monthly", Percent: 40, ResetTime: 0 },
+        { Level: "session", Percent: 40, ResetTime: "soon" }
       ] }
     });
-    assert(junk.quota.every((q) => q.resetAt === null), "missing/zero/non-numeric ResetTime → null");
-
-    // ResetTimestamp alias and UpdateTimestamp go through the same gate.
-    const alias = await quotaOnce({
-      Result: { QuotaUsage: [{ Level: "weekly", Percent: 40, ResetTimestamp: RESET_MS }] } });
-    assert(alias.quota[0].resetAt === RESET_S, "ResetTimestamp alias ms normalized");
-    const updated = await quotaOnce({
-      Result: { UpdateTimestamp: RESET_MS, QuotaUsage: [{ Level: "weekly", Percent: 1 }] } });
-    assert(updated.updatedAt === RESET_S, "updatedAt ms UpdateTimestamp normalized");
+    assert(junk.quota.every((q) => q.resetAt === null), "缺失/0/非数字 ResetTime → null");
+    const alias = await quotaOnce({ Result: { QuotaUsage: [{ Level: "weekly", Percent: 40, ResetTimestamp: RESET_MS }] } });
+    assert(alias.quota[0].resetAt === RESET_S, "ResetTimestamp 别名同样归一化");
+    const updated = await quotaOnce({ Result: { UpdateTimestamp: RESET_MS, QuotaUsage: [{ Level: "weekly", Percent: 1 }] } });
+    assert(updated.updatedAt === RESET_S, "updatedAt 毫秒 UpdateTimestamp 归一化");
   } finally {
     globalThis.fetch = orig;
   }
 }
 
+// --- foldSnap：最小采样间隔、变化才覆盖、超窗口裁剪 ---
+{
+  const T = 1_700_000_000_000;
+  const q = (pct) => [{ level: "monthly", percentUsed: pct }];
+  let snaps = foldSnap([], q(10), T);
+  assert(snaps.length === 1 && snaps[0].p.monthly === 10, "foldSnap：记下第一条快照");
+  snaps = foldSnap(snaps, q(10), T + 60000);
+  assert(snaps.length === 1, "foldSnap：5 分钟内且无变化不新增");
+  snaps = foldSnap(snaps, q(12), T + 120000);
+  assert(snaps.length === 1 && snaps[0].p.monthly === 12, "foldSnap：5 分钟内但有变化 → 覆盖最后一条");
+  snaps = foldSnap(snaps, q(15), T + 10 * 60000);
+  assert(snaps.length === 2, "foldSnap：超过最小间隔后追加");
+  assert(foldSnap(snaps, [], T + 20 * 60000).length === 2, "foldSnap：空 quota 不记快照");
+  const old = pruneSnaps([{ t: T - 20 * 86400000, p: {} }, { t: T - 60000, p: {} }], T);
+  assert(old.length === 1, "pruneSnaps：超出 14 天保留窗口的快照被裁掉");
+  // 多账号包装：互不干扰；state 形状只有 snapsByAccount
+  let ms = { snapsByAccount: {} };
+  ms = foldSnapFor(ms, "personal", q(5), T);
+  ms = foldSnapFor(ms, "company", q(50), T);
+  assert(ms.snapsByAccount.personal[0].p.monthly === 5, "foldSnapFor：personal 快照独立");
+  assert(ms.snapsByAccount.company[0].p.monthly === 50, "foldSnapFor：company 快照独立");
+  assert(foldSnapFor(ms, null, q(1), T) === ms, "foldSnapFor：accountId 为 null 时原样返回");
+}
+
+// --- burnRate：够用 / 撞线 / 样本不足 / 重置回落 ---
+{
+  const T = 1_700_000_000_000;
+  const DAY = 86400000;
+  // 24 小时月度用掉 4 个百分点 → 4%/天
+  const snaps = [
+    { t: T - 2 * DAY, p: { monthly: 10, weekly: 10, session: 0 } },
+    { t: T - DAY, p: { monthly: 16, weekly: 20, session: 0 } }
+  ];
+  const r = burnRate(snaps, "monthly", 20, T);
+  assert(r !== null, "burnRate：样本充足返回结果");
+  assert(Math.abs(r.perDay - 4) < 1e-9, "burnRate：24 小时用 4 点 → 4%/天");
+  assert(Math.abs(r.budgetPerDay - 100 / 30) < 1e-9, "burnRate：月度预算速率 = 100%/30 天");
+  assert(r.ratio > 1, "burnRate：4%/天 快于预算 → 倍率 > 1");
+  assert(r.status === "warn", "burnRate：无投影时 1.0~1.5 倍判为偏快");
+  assert(Math.abs(r.exhaustAt - (T + 20 * DAY)) < 1000, "burnRate：剩余 80% 按 4%/天 → 20 天后耗尽");
+  // 样本不足
+  assert(burnRate([], "monthly", 50, T) === null, "burnRate：没有快照返回 null");
+  assert(burnRate([{ t: T - 30000, p: { monthly: 10 } }], "monthly", 11, T) === null, "burnRate：观测不足 2 分钟返回 null");
+  // 周期重置导致百分比回落（98% → 3%）→ 不当负消耗
+  assert(burnRate([{ t: T - DAY, p: { monthly: 98 } }], "monthly", 3, T) === null, "burnRate：百分比回落（换周期）返回 null");
+  // 已用满时无耗尽时间
+  const full = burnRate([{ t: T - DAY, p: { monthly: 90 } }], "monthly", 100, T);
+  assert(full.exhaustAt === null, "burnRate：已用满时 exhaustAt 为 null");
+  // session 用 5 小时周期算预算速率
+  const sess = burnRate([{ t: T - 3600000, p: { session: 0 } }], "session", 10, T);
+  assert(sess !== null && Math.abs(sess.budgetPerDay - (100 / (5 * 3600000)) * DAY) < 1e-6, "burnRate：session 用 5 小时周期");
+
+  // ── 重置对齐投影 ──
+  // 4%/天，重置在 10 天后：投影 = 20 + 4×10 = 60%；月度周期 30 天 → 时间进度 2/3。
+  const proj = burnRate(snaps, "monthly", 20, T, (T + 10 * DAY) / 1000);
+  assert(Math.abs(proj.projectedAtReset - 60) < 1e-9, "burnRate：投影 = 当前水位 + 速率×剩余时间");
+  assert(Math.abs(proj.timeProgress - (1 - 10 / 30)) < 1e-9, "burnRate：时间进度 = 1 - 剩余/周期");
+  assert(Math.abs(proj.quotaProgress - 0.2) < 1e-9, "burnRate：额度进度 = 当前已用比例");
+  assert(proj.status === "ok", "burnRate：投影 60% < 85% 判 ok（投影优先于倍率）");
+  // 水位高、倍率低但撑不到重置：95% + 1%/天×10 天 = 105% → over
+  const willHit = burnRate([{ t: T - DAY, p: { monthly: 94 } }], "monthly", 95, T, (T + 10 * DAY) / 1000);
+  assert(Math.abs(willHit.projectedAtReset - 105) < 1e-9, "burnRate：撞线投影 = 105%");
+  assert(willHit.status === "over", "burnRate：投影 ≥100% 判 over，即使倍率 <1");
+  assert(willHit.exhaustAt !== null && willHit.exhaustAt < (T + 10 * DAY), "burnRate：撞线时耗尽时刻早于重置");
+  // 85%~100% → warn
+  const tight = burnRate([{ t: T - DAY, p: { monthly: 84 } }], "monthly", 85, T, (T + 10 * DAY) / 1000);
+  assert(tight.status === "warn", "burnRate：投影 85%~100% 判 warn");
+  // 重置时刻已过 → 无投影，退回倍率口径
+  const past = burnRate(snaps, "monthly", 20, T, (T - 3600000) / 1000);
+  assert(past.projectedAtReset === null && past.timeProgress === null, "burnRate：重置时刻已过时投影为 null");
+  assert(past.status === "warn", "burnRate：无投影时状态退回倍率口径");
+  // 重置时刻比整周期还远 → 无投影
+  const far = burnRate(snaps, "monthly", 20, T, (T + 40 * DAY) / 1000);
+  assert(far.projectedAtReset === null, "burnRate：重置时刻超出周期+容差时投影为 null");
+  // 不传 resetAt → 投影字段为 null
+  assert(r.projectedAtReset === null && r.timeProgress === null, "burnRate：不传 resetAt 时投影为 null");
+}
+
+// --- burnRatesFor：多周期，样本不足的周期不出现 ---
+{
+  const T = 1_700_000_000_000;
+  const DAY = 86400000;
+  const rates = burnRatesFor(
+    { snapsByAccount: { a: [{ t: T - DAY, p: { monthly: 10 } }] } },
+    "a",
+    [
+      { level: "monthly", percentUsed: 20, resetAt: (T + 10 * DAY) / 1000 },
+      { level: "weekly", percentUsed: 5 }
+    ],
+    T
+  );
+  assert(rates.monthly !== undefined, "burnRatesFor：有样本的 monthly 出速率");
+  assert(rates.weekly === undefined, "burnRatesFor：weekly 无样本不出现");
+  assert(Math.abs(rates.monthly.projectedAtReset - (20 + 10 * 10)) < 1e-9, "burnRatesFor：resetAt 透传，投影 = 120%");
+  assert(rates.monthly.status === "over", "burnRatesFor：投影 120% 判 over");
+}
+
+// --- migrateStatsState：旧统计字段丢弃，只留快照 ---
+{
+  const T = 1_700_000_000_000;
+  const DAY = 86400000;
+  const oldDoc = {
+    // 旧的请求统计字段（v1 扁平 + v2 byAccount）：必须全部丢弃
+    startedAt: T - 10 * DAY,
+    total: 1234, ok: 1200, fail: 34,
+    buckets: [{ m: 1, ok: 10, fail: 0 }],
+    byAccount: { default: { total: 1234, ok: 1200, fail: 34, buckets: [{ m: 1 }] } },
+    snapsByAccount: {
+      default: [
+        { t: T - 2 * DAY, p: { monthly: 10 } },
+        { t: T - DAY, p: { monthly: 20 } }
+      ],
+      "bad-id!": [{ t: T, p: { monthly: 99 } }],          // 非法账号 id → 过滤
+      expired: [{ t: T - 30 * DAY, p: { monthly: 1 } }]   // 超出 14 天 → 裁剪 → 空键不留
+    }
+  };
+  const m = migrateStatsState(oldDoc, T);
+  assert(!("startedAt" in m) && !("total" in m) && !("byAccount" in m) && !("buckets" in m),
+    "migrateStatsState：旧统计字段（startedAt/total/byAccount/buckets）全部丢弃");
+  assert(Array.isArray(m.snapsByAccount.default) && m.snapsByAccount.default.length === 2, "合法账号快照保留（2 条）");
+  assert(!("bad-id!" in m.snapsByAccount), "非法账号 id 的快照被过滤");
+  assert(!("expired" in m.snapsByAccount), "全部过期的账号不留空键");
+  // 空态/undefined
+  const empty = migrateStatsState(undefined, T);
+  assert(empty && Object.keys(empty.snapsByAccount).length === 0, "migrateStatsState：undefined 入参返回空快照态");
+}
+
+// --- snapshotStatsState：只输出 { snapsByAccount } ---
+{
+  const T = 1_700_000_000_000;
+  const out = snapshotStatsState({
+    // 即使传入带旧统计字段的 state，也只落 snapsByAccount
+    startedAt: T, byAccount: { x: { total: 9 } },
+    snapsByAccount: { a: [{ t: T, p: { monthly: 1 } }] }
+  });
+  assert(JSON.stringify(Object.keys(out).sort()) === JSON.stringify(["snapsByAccount"]), "snapshotStatsState：输出只有 snapsByAccount 一个键");
+  assert(out.snapsByAccount.a.length === 1, "snapshotStatsState：快照内容保留");
+}
+
+// --- mergeStatsState：落盘 + 内存合并、按时间排序、空键不留 ---
+{
+  const T = 1_700_000_000_000;
+  const DAY = 86400000;
+  const stored = { snapsByAccount: {
+    default: [{ t: T - 3 * DAY, p: { monthly: 5 } }, { t: T - DAY, p: { monthly: 20 } }],
+    stale: [{ t: T - 30 * DAY, p: { monthly: 1 } }]   // 全过期 → 合并不留空键
+  } };
+  const live = { snapsByAccount: {
+    default: [{ t: T - 2 * DAY, p: { monthly: 12 } }, { t: T, p: { monthly: 30 } }],
+    personal: [{ t: T, p: { monthly: 8 } }]
+  } };
+  const merged = mergeStatsState(stored, live, T);
+  assert(merged.snapsByAccount.default.length === 4, "mergeStatsState：同账号落盘+内存快照合并（4 条）");
+  assert(merged.snapsByAccount.default.every((s, i, arr) => i === 0 || arr[i - 1].t <= s.t), "mergeStatsState：合并后按时间升序");
+  assert(merged.snapsByAccount.personal.length === 1, "mergeStatsState：仅内存里的账号保留");
+  assert(!("stale" in merged.snapsByAccount), "mergeStatsState：全过期账号不留空键");
+  assert(!("startedAt" in merged) && !("byAccount" in merged), "mergeStatsState：输出不含旧统计字段");
+}
+
+// --- 账号解析纯函数：迁移、当前账号、provider 归属、中文 label ---
+{
+  // 旧单账号配置 → 合成 default 账号
+  const migrated = migrateAccounts({ accessKeyId: "ak", secretAccessKey: "sk", region: "cn-beijing", version: "v1" });
+  assert(migrated.length === 1 && migrated[0].id === LEGACY_ACCOUNT_ID, "migrateAccounts：旧单账号迁移成 default");
+  assert(migrated[0].accessKeyId === "ak", "migrateAccounts：密钥搬进账号");
+  assert(migrated[0].providers.length === 0, "migrateAccounts：迁移出的账号默认不关联 provider");
+  assert(migrateAccounts({}).length === 0, "migrateAccounts：空配置返回空列表");
+  // 中文显示名原样保留
+  const zh = migrateAccounts({ accounts: [
+    { id: "personal", label: "  个人号  ", accessKeyId: "a", secretAccessKey: "b", providers: [] }
+  ] });
+  assert(zh[0].label === "个人号", "migrateAccounts：中文 label 保留并裁剪首尾空白");
+  // accounts 存在时忽略顶层旧字段；provider 去重去空
+  const both = migrateAccounts({
+    accessKeyId: "old",
+    accounts: [{ id: "a", label: "A", accessKeyId: "new", secretAccessKey: "s", providers: ["p1", "p1", ""] }]
+  });
+  assert(both[0].accessKeyId === "new", "migrateAccounts：accounts 优先于顶层旧字段");
+  assert(both[0].providers.length === 1, "migrateAccounts：provider 去重且剔除空串");
+  // 脏 id / 重复 id 丢弃；标签留空回落 id
+  const dirty = migrateAccounts({ accounts: [
+    { id: "Bad-Id", label: "x" },
+    { id: "ok1", label: "" },
+    { id: "ok1", label: "dup" },
+    { id: "", label: "empty" }
+  ] });
+  assert(dirty.length === 1 && dirty[0].id === "ok1", "migrateAccounts：丢弃不合法与重复 id");
+  assert(dirty[0].label === "ok1", "migrateAccounts：标签留空回落到 id");
+  assert(ACCOUNT_ID_RE.test("company_2") && !ACCOUNT_ID_RE.test("Company") && !ACCOUNT_ID_RE.test("中文"),
+    "ACCOUNT_ID_RE：只允许小写字母开头的英文/数字/下划线");
+  // 当前账号回落
+  const accs = migrateAccounts(multiConfig());
+  assert(resolveActiveAccountId(accs, "company") === "company", "resolveActiveAccountId：命中已存在账号");
+  assert(resolveActiveAccountId(accs, "ghost") === "personal", "resolveActiveAccountId：失效 id 回落到第一个");
+  assert(resolveActiveAccountId([], "x") === null, "resolveActiveAccountId：无账号返回 null");
+  // migrateAccounts 保留各账号的 providers 归属
+  assert(Array.isArray(accs.find((a) => a.id === "personal").providers), "migrateAccounts：providers 归属随账号保留");
+  assert(accs.find((a) => a.id === "personal").providers.includes("ark-coding-plan"), "migrateAccounts：personal 关联 ark-coding-plan");
+}
+
+// --- isArkProvider：域名硬证据优先，读不到退回名称特征 ---
+{
+  const urls = {
+    "ark-coding-plan": "https://ark.cn-beijing.volces.com/api/coding/v3",
+    "ark-other": "https://open.volcengine.com/api/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "relay": "https://sub2api.example.invalid",
+    "fake": "https://volces.com.evil.example/api"
+  };
+  assert(isArkProvider({ id: "ark-coding-plan" }, urls), "isArkProvider：volces.com 域名 → true");
+  assert(isArkProvider({ id: "ark-other" }, urls), "isArkProvider：volcengine.com 域名 → true");
+  assert(!isArkProvider({ id: "deepseek" }, urls), "isArkProvider：deepseek.com 域名 → false");
+  assert(!isArkProvider({ id: "relay" }, urls), "isArkProvider：第三方域名 → false");
+  assert(!isArkProvider({ id: "fake" }, urls), "isArkProvider：伪造前缀 volces.com.evil.example 不被误判");
+  // 有 baseURL 时名字不参与判定
+  assert(!isArkProvider({ id: "relay", name: "ark 中转" }, urls), "isArkProvider：有 baseURL 时名字不算数");
+  // 无 baseURL → 名称特征兜底
+  assert(isArkProvider({ id: "ark-coding-plan" }, {}), "isArkProvider：无 baseURL 时 id 含 ark → true");
+  assert(isArkProvider({ id: "x1", name: "火山 Agent Plan" }, {}), "isArkProvider：无 baseURL 时名称含火山 → true");
+  assert(!isArkProvider({ id: "deepseek-official", name: "DeepSeek" }, {}), "isArkProvider：deepseek-official 名称不含方舟特征 → false");
+  assert(!isArkProvider({ id: "newapi-mo", name: "第三方中转" }, {}), "isArkProvider：无特征词路由 → false");
+  assert(!isArkProvider({ id: "my-coding-plan" }, {}), "isArkProvider：通用词 coding/plan 不构成方舟特征");
+}
+
+// --- /ark-quota/providers：默认只列火山、claimed + foreignClaimed、?all=1 ---
+{
+  const ctx = mockCtx();
+  // company 误关联了内置 deepseek-official 路由 → 应进 foreignClaimed 警告
+  apply(ctx, {
+    accounts: [
+      { id: "personal", label: "个人", accessKeyId: "ak-p", secretAccessKey: "sk-p", region: "cn-beijing", version: "2024-01-01", providers: ["ark-coding-plan"] },
+      { id: "company", label: "公司", accessKeyId: "ak-c", secretAccessKey: "sk-c", region: "cn-beijing", version: "2024-01-01", providers: ["ark-coding-plan-company", "deepseek-official"] }
+    ],
+    activeAccountId: "company",
+    refreshMs: 300000
+  });
+  const { res, json } = await call(ctx, "/ark-quota/providers", "GET", "/ark-quota/providers");
+  assert(res.statusCode === 200, "/providers：200");
+  assert(json.providers.length === 2, "/providers：默认只列 2 个火山路由");
+  assert(json.providers.every((p) => p.id.startsWith("ark-")), "/providers：列出的都是方舟路由");
+  assert(json.filtered === 2 && json.totalProviders === 4, "/providers：报告隐藏了 2 个非方舟路由（共 4）");
+  assert(json.claimed["ark-coding-plan"] === "personal", "/providers：带出 claimed 归属");
+  assert(json.claimed["deepseek-official"] === "company", "/providers：误关联路由也在 claimed 里");
+  // 误关联的非方舟路由单独点名
+  assert(Array.isArray(json.foreignClaimed) && json.foreignClaimed.length === 1, "/providers：foreignClaimed 有 1 条");
+  assert(json.foreignClaimed[0].id === "deepseek-official" && json.foreignClaimed[0].owner === "company",
+    "/providers：foreignClaimed 点名 deepseek-official 属于 company");
+  assert(!JSON.stringify(json).includes("ak-p") && !JSON.stringify(json).includes("sk-c"), "/providers：不泄露密钥");
+  // ?all=1 列出全部
+  const allRes = await call(ctx, "/ark-quota/providers", "GET", "/ark-quota/providers?all=1");
+  assert(allRes.json.providers.length === 4, "/providers?all=1：列出全部 4 个路由");
+  assert(allRes.json.providers.some((p) => p.id === "deepseek-official"), "/providers?all=1：包含 deepseek-official");
+  assert(allRes.json.filtered === 0, "/providers?all=1：filtered 为 0");
+  // 无 llm 服务时回空列表而不是 500
+  const bare = mockCtx({ llm: false });
+  apply(bare, multiConfig());
+  const bareRes = await call(bare, "/ark-quota/providers", "GET", "/ark-quota/providers");
+  assert(bareRes.res.statusCode === 200 && bareRes.json.providers.length === 0, "无 llm 服务时 providers 返回空列表");
+  // 读不到别插件设置时，靠名称特征仍能筛出方舟路由
+  const nameOnly = mockCtx({ otherSettings: false });
+  apply(nameOnly, multiConfig());
+  const noSettings = await call(nameOnly, "/ark-quota/providers", "GET", "/ark-quota/providers");
+  assert(noSettings.json.providers.length === 2, "无 baseURL 时按名称特征仍筛出 2 个 ark- 路由");
+}
+
+// --- /ark-quota/accounts：add / remove / update / activate ---
+{
+  const ctx = mockCtx();
+  apply(ctx, multiConfig());
+  const added = await call(ctx, "/ark-quota/accounts", "POST", "/ark-quota/accounts", { action: "add", id: "team", label: "团队" });
+  assert(added.res.statusCode === 200, "accounts add：200");
+  assert(added.json.accounts.length === 3, "accounts add：账号数变 3");
+  assert(added.json.accounts.some((a) => a.id === "team" && a.configured === false), "accounts add：新账号未配密钥");
+  const badId = await call(ctx, "/ark-quota/accounts", "POST", "/ark-quota/accounts", { action: "add", id: "Bad-Id" });
+  assert(badId.res.statusCode === 400 && badId.json.code === "bad-id", "accounts add：非法 id → 400");
+  const dup = await call(ctx, "/ark-quota/accounts", "POST", "/ark-quota/accounts", { action: "add", id: "team" });
+  assert(dup.res.statusCode === 409 && dup.json.code === "duplicate", "accounts add：重复 id → 409");
+  // update：中文标签 + provider 去重去空
+  const updated = await call(ctx, "/ark-quota/accounts", "POST", "/ark-quota/accounts", {
+    action: "update", id: "team", label: "团队账号", providers: ["newapi-mo", "newapi-mo", ""]
+  });
+  const team = updated.json.accounts.find((a) => a.id === "team");
+  assert(team.label === "团队账号", "accounts update：中文标签已保存");
+  assert(team.providers.length === 1 && team.providers[0] === "newapi-mo", "accounts update：provider 去重去空");
+  // update 无有效字段 → 400
+  const noop = await call(ctx, "/ark-quota/accounts", "POST", "/ark-quota/accounts", { action: "update", id: "team" });
+  assert(noop.res.statusCode === 400 && noop.json.code === "noop", "accounts update：无 label/providers → 400");
+  // activate
+  const activated = await call(ctx, "/ark-quota/accounts", "POST", "/ark-quota/accounts", { action: "activate", id: "personal" });
+  assert(activated.json.activeAccountId === "personal", "accounts activate：当前账号切换");
+  // remove：删掉当前账号 → 回落
+  const removed = await call(ctx, "/ark-quota/accounts", "POST", "/ark-quota/accounts", { action: "remove", id: "personal" });
+  assert(removed.json.accounts.length === 2, "accounts remove：账号数减一");
+  assert(removed.json.activeAccountId !== "personal", "accounts remove：删掉当前账号后回落");
+  // 未知账号 / 非法 action
+  const ghost = await call(ctx, "/ark-quota/accounts", "POST", "/ark-quota/accounts", { action: "update", id: "ghost", label: "x" });
+  assert(ghost.res.statusCode === 404, "accounts update：未知账号 → 404");
+  const badAction = await call(ctx, "/ark-quota/accounts", "POST", "/ark-quota/accounts", { action: "nope", id: "team" });
+  assert(badAction.res.statusCode === 400 && badAction.json.code === "bad-action", "accounts：非法 action → 400");
+  const getRes = await call(ctx, "/ark-quota/accounts", "GET", "/ark-quota/accounts");
+  assert(getRes.res.statusCode === 405, "accounts：GET → 405");
+  assert(!JSON.stringify(removed.json).includes("ak-company"), "accounts：响应不泄露密钥");
+}
+
+// --- /ark-quota/stats 路由已移除（请求统计功能下线）---
+{
+  const ctx = mockCtx();
+  apply(ctx, multiConfig());
+  assert(!ctx.__routes.has("/ark-quota/stats"), "/ark-quota/stats 路由已不再注册");
+  const gone = await call(ctx, "/ark-quota/stats", "GET", "/ark-quota/stats");
+  assert(gone.__missing === true, "调用 /ark-quota/stats 找不到 handler（功能已下线）");
+  // 其余路由仍在
+  for (const p of ["/ark-quota", "/ark-quota/status", "/ark-quota/providers", "/ark-quota/credentials", "/ark-quota/accounts", "/ark-quota/settings"]) {
+    assert(ctx.__routes.has(p), `路由仍注册：${p}`);
+  }
+}
+
+// --- 快照域正常打开（域名合法、schema 不接受 null）---
+{
+  const ctx = mockCtx();
+  apply(ctx, multiConfig());
+  await new Promise((r) => setTimeout(r, 20));
+  const spec = ctx.__openedSpec();
+  assert(spec !== null, "快照域成功打开");
+  assert(/^[a-z][a-z0-9_]*$/.test(spec.name) && !spec.name.includes("-"), "落盘域名符合 UNIT_NAME_RE（不含连字符）");
+  // storageDomain 不可用时不报错（退回内存态）
+  const bare = mockCtx({ storageDomain: false });
+  apply(bare, multiConfig());
+  await new Promise((r) => setTimeout(r, 20));
+  assert(bare.__openedSpec() === null, "无 storageDomain 时不开域，插件不报错");
+}
+
 if (failed) {
-  console.error(`\n${failed} assertion(s) failed`);
+  console.error(`\n${failed} 个断言失败`);
   process.exit(1);
 }
-console.log("\nsmoke-host: all passed");
+console.log("\nsmoke-host: 全部通过");

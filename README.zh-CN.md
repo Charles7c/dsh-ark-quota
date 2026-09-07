@@ -4,7 +4,7 @@
 
 **火山方舟（Volcano Ark）Coding Plan 订阅套餐剩余额度** —— DeepSeek Harness（DSH）Web 插件，在侧边栏底部以固定小组件实时展示你的套餐额度，无需离开 DSH 界面。
 
-> 当前版本：`v0.1.1`（版本号见 [VERSION](./VERSION)）
+> 当前版本：`v0.1.3`（版本号见 [VERSION](./VERSION)）
 
 - 宿主半区（`lib/index.js`）：由于 OpenAPI 网关不允许来自 DSH 源（127.0.0.1:3080）的跨域（CORS）请求，由宿主用你的火山引擎**访问密钥 AK/SK**（SigV4 变体签名）在同源路由 `/ark-quota` 上代理控制面 OpenAPI `GetCodingPlanUsage`（未订阅时自动回落到 Agent Plan 的 `GetAFPUsage`）。**无浏览器、无 Cookie、无 CSRF**。
 - 浏览器半区（`lib/client.js`）：渲染额度卡片 / 窄条百分比胶囊，并在设置变更时自动刷新；同时在 **设置 → 方舟额度** 提供独立的顶级配置分区，可直接在 DSH 设置界面粘贴 AK/SK。
@@ -14,10 +14,13 @@
 
 ## 功能特性
 
-- **侧边栏固定小组件**：侧边栏底部操作区显示宽版卡片（5小时 / 近1周 / 近1月三条用量进度，可切换显示已用或剩余百分比），窄版显示近1月百分比胶囊。悬停任意一行可查看精确百分比、绝对用量（如有）与精确重置时刻。
+- **侧边栏固定小组件**：侧边栏底部操作区显示宽版卡片（5小时 / 近1周 / 近1月三条用量进度，显示已用百分比），窄版显示近1月百分比胶囊。悬停任意一行可查看精确百分比、绝对用量（如有）与精确重置时刻。
+- **耗尽时间预测**：插件在每次刷新时记录一帧额度快照，按近期消耗速度外推，直接给出一句话结论——「重置时预计用到 71%，够用」「余量紧张」，或超速时「预计 MM-DD HH:mm 用完，比重置早 N 天」。进度条上的竖线刻度标出预测位置。快照通过 `ctx.storageDomain` 落盘，重启后观测历史不丢。
+- **多账号**：一组 AK/SK 只代表一个火山账号，因此插件维护的是账号列表。卡片头部右上角的下拉即可切换当前查看的账号（任意账号数量都稳定），切换结果会写回作为默认账号。显示名称支持中文。
+- **路由归属与误配提醒**：每个账号可勾选属于它的 `llm` 提供方路由。设置界面默认只列出指向火山方舟端点（`volces.com` / `volcengine.com`）的路由；若已有路由被误勾到非火山端点（例如 `deepseek-official`），会明确点名提醒，可一键展开全部后取消。
 - **Agent Plan 自动回落**：账号未订阅 Coding Plan 时，代理自动探测 `GetAFPUsage` 并渲染绝对额度窗口。
 - **免重启维护**：密钥从 `ark-quota` 设置命名空间读取（`$DSH_HOME/settings.yaml`，由 `dsh-settings-file` 热重载）。任何变更立即清空缓存——**无需重启服务**。
-- **设置界面配置**：DSH 设置 → **方舟额度** 顶级分区（与「侧边卡片」「配置同步」同级），一键保存 AK/SK（只写字段、热生效）。
+- **设置界面配置**：DSH 设置 → **方舟额度** 顶级分区（与「侧边卡片」「配置同步」同级），可增删账号、改显示名（中文、回车即存）、勾选所属提供方，并一键保存 AK/SK（只写字段、热生效，且带防浏览器自动填充处理）。
 
 ## 环境要求
 
@@ -54,12 +57,20 @@
        - id: ark-quota
          name: dsh-ark-quota
          config:
-           accessKeyId: ''        # 可留空——更推荐直接在 DSH 设置界面填写
-           secretAccessKey: ''
-           region: cn-beijing
-           version: '2024-01-01'
+           accounts:
+             - id: personal              # 需匹配 /^[a-z][a-z0-9_]*$/，内部标识；显示名用 label（可中文）
+               label: 个人 Pro
+               accessKeyId: ''           # 可留空——更推荐直接在 DSH 设置界面填写
+               secretAccessKey: ''
+               region: cn-beijing
+               version: '2024-01-01'
+               providers: [ark-coding-plan]
+           activeAccountId: personal
            refreshMs: 300000
    ```
+
+   旧的单账号写法（顶层 `accessKeyId` / `secretAccessKey`，没有 `accounts`）依然可用，
+   会被自动迁移成一个 id 为 `default` 的账号。
 
 4. 应用并验证。较新版本的 DSH 会通过 HMR 监听器热应用 `cordis.patch.yml` 的变更（宿主路由与客户端启动图无需重启即可重组）——用 `curl -i http://127.0.0.1:3080/ark-quota` 检查；若路由未生效，再重启 DSH 服务并刷新浏览器。侧边栏底部即出现小组件。
 
@@ -73,25 +84,43 @@
 
 ## 使用
 
-- 小组件按 `refreshMs`（默认 5 分钟，可在"设置 → 方舟额度"里改为 1/5/10/30 分钟或 1 小时）自适应轮询 `/ark-quota`，并在设置命名空间变更时立即刷新。
-- 点击 **⟳** 按钮（或访问 `/ark-quota?force=1`）可强制立即刷新。
+- 小组件按 `refreshMs`（默认 5 分钟，可在"设置 → 方舟额度"里改为 1/5/10/30 分钟或 1 小时）自适应轮询 `/ark-quota`，并在设置命名空间变更时立即刷新。只轮询当前查看的账号；其它账号按需加载（缓存新鲜时不请求上游）。
+- 点击 **⟳** 按钮（或访问 `/ark-quota?force=1`）可强制立即刷新当前账号。
+- 配置了 2 个及以上账号时，卡片头部右上角出现账号下拉。切换会换掉额度数据与耗尽预测，并把选择写回作为默认账号。
+- 耗尽预测基于近期消耗速度（5 小时窗口看近 30 分钟、周窗口看近 12 小时、月窗口看近 24 小时），样本不足（刚开始用、或刚跨过重置点）时暂不显示结论。
 - 密钥缺失或错误时显示错误卡片；在 **设置 → 方舟额度** 里修正（或重跑 `node tools/check.mjs`），组件会自动更新。
 
 ## 配置说明
 
 所有配置存放在 `ark-quota` 设置命名空间。`cordis.patch.yml` 中的组合条目配置作为**基础层（base）**，`$DSH_HOME/settings.yaml` 中的用户层可覆盖它并热生效。
 
-| 键              | 类型   | 默认值       | 说明                                        |
-| --------------- | ------ | ------------ | ------------------------------------------- |
-| `accessKeyId`   | string | `""`（secret）| 火山引擎 AccessKey ID（签名每次 OpenAPI 调用）|
-| `secretAccessKey`| string | `""`（secret）| 火山引擎 Secret Access Key                    |
-| `region`        | string | `cn-beijing` | 方舟地域                                    |
-| `version`       | string | `2024-01-01` | 控制面 OpenAPI 版本                          |
-| `refreshMs`     | number | `300000`     | 代理缓存有效期；仅允许 `60000` / `300000` / `600000` / `1800000` / `3600000`。其它值会吸附到最近的白名单档位。 |
+| 键                | 类型   | 默认值       | 说明                                        |
+| ----------------- | ------ | ------------ | ------------------------------------------- |
+| `accounts`        | array  | `[]`         | 火山账号列表（见下表）。为空时读取下面的旧版顶层字段，并迁移成一个 `default` 账号。 |
+| `activeAccountId` | string | `""`         | 卡片默认显示哪个账号；指向不存在的账号时回落到第一个。 |
+| `refreshMs`       | number | `300000`     | 代理缓存有效期；仅允许 `60000` / `300000` / `600000` / `1800000` / `3600000`。其它值会吸附到最近的白名单档位。 |
+| `accessKeyId`     | string | `""`（secret）| **旧版**单账号 AccessKey ID，仅在 `accounts` 为空时读取。 |
+| `secretAccessKey` | string | `""`（secret）| **旧版**单账号 Secret Access Key。            |
+| `region`          | string | `cn-beijing` | 旧版默认地域。                                |
+| `version`         | string | `2024-01-01` | 旧版默认控制面 OpenAPI 版本。                  |
+
+`accounts` 中每一项：
+
+| 键                | 类型     | 默认值       | 说明                                      |
+| ----------------- | -------- | ------------ | ----------------------------------------- |
+| `id`              | string   | —            | 内部稳定标识，需匹配 `/^[a-z][a-z0-9_]*$/`；同时作为该账号额度快照的落盘键。不合法或重复的 id 会被丢弃。 |
+| `label`           | string   | 同 `id`      | 卡片与设置界面显示的名称，可任意填写（支持中文）。 |
+| `accessKeyId`     | string   | `""`（secret）| 该账号的火山 AccessKey ID。                 |
+| `secretAccessKey` | string   | `""`（secret）| 该账号的火山 Secret Access Key。            |
+| `region`          | string   | `cn-beijing` | 方舟地域。                                  |
+| `version`         | string   | `2024-01-01` | 控制面 OpenAPI 版本。                        |
+| `providers`       | string[] | `[]`         | 属于本账号的 `llm` 提供方路由 id，用于在设置界面标识归属、并在勾到非火山端点时给出误配提醒。可留空（只看额度）。 |
+
+> 关于 `providers`：它标记"哪条模型路由指向这个火山账号"。设置界面默认只列出 baseURL 指向火山方舟端点的路由，并对误勾到非火山路由（如 `deepseek-official`）给出警告；`?all=1` 可展开全部。显示名 `label` 可任意填写（支持中文），内部 `id` 只能小写字母/数字/下划线。
 
 ## API
 
-`GET /ark-quota` → 同源 JSON：
+`GET /ark-quota[?account=<id>][&force=1]` → 同源 JSON：
 
 ```json
 {
@@ -102,19 +131,29 @@
   "cachedAt": 1786639101000,
   "refreshMs": 300000,
   "hasReward": false,
+  "accountId": "personal",
+  "accountLabel": "个人 Pro",
+  "accounts": [{ "id": "personal", "label": "个人 Pro", "configured": true, "providers": ["ark-coding-plan"] }],
+  "activeAccountId": "personal",
   "quota": [
     { "level": "monthly", "percentUsed": 90.18, "percentRemaining": 9.82, "cap": 100, "rewardTotalPercent": 0, "resetAt": 1786639101, "used": 90, "total": 100 }
   ]
 }
 ```
 
-`cachedAt` 为毫秒时间戳（该 payload 写入宿主缓存的时刻）。`updatedAt` / `resetAt` 仍为控制台 API 返回的 unix 秒。
+`cachedAt` 为毫秒时间戳（该 payload 写入宿主缓存的时刻）。`updatedAt` / `resetAt` 仍为控制台 API 返回的 unix 秒。每个账号各自独立缓存。
 
-失败时返回：`{ "ok": false, "code": "unauthorized" | "upstream" | "network", "message": "…" }`（HTTP 状态码分别为 401 / 502 / 504）。
+失败时返回：`{ "ok": false, "code": "unauthorized" | "missing-auth" | "unknown-account" | "upstream" | "network", "message": "…", "accounts": [...] }`（HTTP 401 / 404 / 502 / 504）。失败响应也会带上账号列表，这样密钥失效时切换器不会消失。
+
+`GET /ark-quota/providers` → `{ ok, providers: [{ id, name }], claimed: { <提供方 id>: <账号 id> }, foreignClaimed: [{ id, name, owner }], filtered, totalProviders }`——`llm` 服务已注册的路由，以及各自被哪个账号占用。默认只返回指向火山方舟端点的路由；`foreignClaimed` 列出已关联但**不是**火山端点的路由（误配提醒），`?all=1` 可列出全部。不含任何凭据。
+
+`POST /ark-quota/accounts` → `{ action: "add" | "remove" | "update" | "activate", id, label?, providers? }`，返回与 `/ark-quota/status` 相同的载荷。密钥仍走 `/ark-quota/credentials`（新增可选的 `account` 字段），且从不回显。
+
+> 额度响应里的 `burn` 字段（按账号、按周期）给出耗尽预测：`perDay`（近期消耗速度，%/天）、`budgetPerDay`（匀速用完的预算速度）、`ratio`（倍率）、`projectedAtReset`（按当前速度到重置时的预计已用百分比，可能 >100）、`exhaustAt`（预计耗尽时刻，毫秒）、`status`（`ok` / `warn` / `over`）、`sampleMs`（观测窗口长度）。
 
 ## 安全说明
 
-- `/ark-quota`、`/ark-quota/status`、`/ark-quota/credentials`、`/ark-quota/settings` 四个路由**仅限本机**（绑定在 DSH 服务上）且**无鉴权**：同一台机器上的任何进程都能读取你的额度数据、触发一次带鉴权的刷新、通过 `POST /ark-quota/credentials` 覆盖访问密钥，或通过 `POST /ark-quota/settings` 修改轮询间隔（影响面等同本机可直接读写 `settings.yaml`）。但它们**绝不会回显你的访问密钥**（响应只含布尔状态 / 额度数字）；`/ark-quota/credentials` 只接受固定形状的 `accessKeyId` / `secretAccessKey` 字段，`/ark-quota/settings` 只接受固定白名单中的 `refreshMs` 数值，都不接受任何用户可控的 URL，因此无法作为代理/SSRF 跳板或泄漏火山凭据。插件加载期间请勿将 DSH 服务暴露到非回环地址。
+- `/ark-quota`、`/ark-quota/status`、`/ark-quota/providers`、`/ark-quota/accounts`、`/ark-quota/credentials`、`/ark-quota/settings` 这些路由**仅限本机**（绑定在 DSH 服务上）且**无鉴权**：同一台机器上的任何进程都能读取你的额度数据、触发一次带鉴权的刷新、通过 `POST /ark-quota/credentials` 覆盖访问密钥、通过 `POST /ark-quota/accounts` 增删账号，或通过 `POST /ark-quota/settings` 修改轮询间隔（影响面等同本机可直接读写 `settings.yaml`）。但它们**绝不会回显你的访问密钥**（响应只含布尔状态 / 额度数字 / 账号 id 与标签）；`/ark-quota/credentials` 只接受固定形状的 `account` / `accessKeyId` / `secretAccessKey` 字段，`/ark-quota/accounts` 只接受固定的 action 加 id、标签与提供方 id 列表，`/ark-quota/settings` 只接受固定白名单中的 `refreshMs` 数值，都不接受任何用户可控的 URL，因此无法作为代理/SSRF 跳板或泄漏火山凭据。插件加载期间请勿将 DSH 服务暴露到非回环地址。
 - 访问密钥是真实凭据，存放于 `$DSH_HOME` 下的 `cordis.patch.yml` / `settings.yaml`；在设置 schema 中以 `role('secret')` 声明（DSH 设置界面以只写字段展示、绝不把值回传浏览器），并**已被 git 排除**（见 `.gitignore`）。
 - `tools/check.mjs` 只用命令行 / `ARK_AK` / `ARK_SK` 传入的密钥签名一次请求，**不写盘、不全量打印**。
 
