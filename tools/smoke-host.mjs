@@ -416,20 +416,20 @@ assert(ALLOWED_REFRESH_MS.length === 5, "刷新档位共 5 个");
 {
   const T = 1_700_000_000_000;
   const DAY = 86400000;
-  // 三点（-48h:10 基线、-23h:16 窗口内、现在:20）最小二乘斜率 ≈ 5%/天；
-  // 窗口内每个观测都参与回归（抗突发能力见下方 burst 用例）
+  // 三点（-48h:10 基线、-23h:16 窗口内、现在:20）加权最小二乘：半衰期
+  // 8h，近期点权重高，斜率偏向近期（≈4.3%/天；旧等权口径为 5%/天）。
   const snaps = [
     { t: T - 2 * DAY, p: { monthly: 10, weekly: 10, session: 0 } },
     { t: T - 23 * 3600000, p: { monthly: 16, weekly: 20, session: 0 } }
   ];
   const r = burnRate(snaps, "monthly", 20, T);
   assert(r !== null, "burnRate：样本充足返回结果");
-  assert(Math.abs(r.perDay - 5) < 0.1, "burnRate：三点 OLS 斜率 ≈ 5%/天");
+  assert(Math.abs(r.perDay - 4.3) < 0.4, "burnRate：加权 OLS 斜率 ≈ 4.3%/天（偏向近期），实际 " + r.perDay.toFixed(2));
   assert(r.samples === 3, "burnRate：样本数 = 两条快照 + 当前水位");
   assert(Math.abs(r.budgetPerDay - 100 / 30) < 1e-9, "burnRate：月度预算速率 = 100%/30 天");
-  assert(r.ratio > 1, "burnRate：5%/天 快于预算 → 倍率 > 1");
+  assert(r.ratio > 1, "burnRate：4.3%/天 快于预算 → 倍率 > 1");
   assert(r.status === "warn", "burnRate：无投影时 1.0~1.5 倍判为偏快");
-  assert(Math.abs(r.exhaustAt - (T + 16 * DAY)) < DAY, "burnRate：剩余 80% 按 5%/天 → 约 16 天后耗尽");
+  assert(Math.abs(r.exhaustAt - (T + 18.6 * DAY)) < 2 * DAY, "burnRate：剩余 80% 按 4.3%/天 → 约 19 天后耗尽");
   // 样本不足
   assert(burnRate([], "monthly", 50, T) === null, "burnRate：没有快照返回 null");
   assert(burnRate([{ t: T - 30000, p: { monthly: 10 } }], "monthly", 11, T) === null, "burnRate：观测跨度不足月档最小跨度（6 小时）返回 null");

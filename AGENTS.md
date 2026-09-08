@@ -78,7 +78,8 @@ This plugin moves **real credentials** (Volcengine access keys: `accessKeyId` / 
 3. Host smoke test (mock `ctx` with `webServer`/`settings`/`effect`/`logger`, no server): namespace registers with patch config as base; `scope.get()` drives effective config; a settings change (watch callback) drops the cache; missing keys → `missing-auth` 401; broken keys → 401 with a signed request; coding-plan success shape; agent-plan fallback; HEAD → no body; network → 504.
 4. Client render smoke test: load the bundle under a `window.__ModuleLoader__` stub, `apply` with mock `slots` (inject = `["slots"]` only, no settingsScope), SSR with `react-dom/server` (wide + rail + settings section).
 5. Host route smoke test (mock `ctx`, no server): `/ark-quota/status` returns booleans without leaking keys; `POST /ark-quota/credentials` trims + allowlists only `accessKeyId`/`secretAccessKey`, persists via `scope.update`, returns no secret echo; empty body → 400, GET → 405.
-6. End-to-end: restart DSH → `curl http://127.0.0.1:3080/ark-quota?force=1` returns fresh quota → widget renders in the sidebar footer → save AK/SK in the Settings → 方舟额度 section and confirm the widget updates without restart.
+6. Burn-model regression (`node tools/verify-burn.mjs`, plain Node, no server): sliding-window net rise (inflow − aging), aging rate from pre-window snapshots, recovery time when capped, thresholded reset-drop truncation, weighted-OLS sanity, and fixed-period projection — the `burnRate`/`foldSnap` pure functions only.
+7. End-to-end: restart DSH → `curl http://127.0.0.1:3080/ark-quota?force=1` returns fresh quota → widget renders in the sidebar footer → save AK/SK in the Settings → 方舟额度 section and confirm the widget updates without restart.
 
 ## Release gate
 

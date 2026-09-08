@@ -145,11 +145,13 @@ assert(wide.includes("分钟前更新") || wide.includes("刚刚更新"), "显�
 assert(!wide.includes("100%"), "99.9% 没有被四舍五入成 100%");
 assert(wide.includes("99.9%"), "99.9% 保留一位小数显示");
 
-// 用量节奏结论行（主角口径：额度进度 vs 时间进度）
-assert(wide.includes("时间过了") && wide.includes("额度用了") && wide.includes("节奏正常"), "月档安全节奏给出「节奏正常」结论");
-assert(wide.includes("用完") && wide.includes("比重置早"), "周档撞线给出「预计用完，比重置早…」结论");
-// 旧的近期外推点估计文案已下线
-assert(!wide.includes("重置时预计用到"), "不再出现「重置时预计用到 X%」的伪精确文案");
+// 结论行已下线：状态靠进度条与速率颜色表达，细节全在悬停提示（title）里
+assert(!wide.includes("节奏正常") && !wide.includes("余量偏紧"), "行内不再渲染结论文字");
+assert(wideEl.innerHTML.includes("用完"), "用完时刻细节在悬停提示里");
+assert(wideEl.innerHTML.includes("比重置早"), "「比重置早…」细节在悬停提示里");
+assert(wideEl.innerHTML.includes("时间 ") && wideEl.innerHTML.includes("额度 "), "时间/额度进度细节在悬停提示里");
+// 速率胶囊在行内
+assert(wide.includes("%/天"), "行内显示速率胶囊（%/天）");
 
 // 账号切换器：头部 <select>，多账号
 const selects = wideEl.querySelectorAll("select");
