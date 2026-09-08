@@ -76,14 +76,16 @@ globalThis.fetch = async (url, opts) => {
       ],
       burn: {
         monthly: {
-          perDay: 3.2, budgetPerDay: 3.33, ratio: 0.96, status: "ok",
+          // 平均节奏投影（主角）：额度进度 23% ÷ 时间进度 33% = 0.7× → 投影 69%，正常
+          perDay: 3.2, budgetPerDay: 3.33, ratio: 0.96, paceRatio: 0.7, trendRatio: 1.37, status: "ok",
           exhaustAt: Date.now() + 20 * 86400000,
-          projectedAtReset: 71, timeProgress: 0.23, quotaProgress: 0.23, sampleMs: 86400000
+          projectedAtReset: 69, timeProgress: 0.33, quotaProgress: 0.23, sampleMs: 86400000, samples: 14
         },
         weekly: {
-          perDay: 40, budgetPerDay: 14.3, ratio: 2.8, status: "over",
+          // 平均节奏投影 140% → 撞线；短期档给预计用完时刻
+          perDay: 40, budgetPerDay: 14.3, ratio: 2.8, paceRatio: 1.4, trendRatio: 2.0, status: "over",
           exhaustAt: Date.now() + 12 * 3600000,
-          projectedAtReset: 130, timeProgress: 0.5, quotaProgress: 0.8, sampleMs: 12 * 3600000
+          projectedAtReset: 140, timeProgress: 0.57, quotaProgress: 0.8, sampleMs: 12 * 3600000, samples: 8
         }
       }
     };
@@ -143,9 +145,11 @@ assert(wide.includes("分钟前更新") || wide.includes("刚刚更新"), "显�
 assert(!wide.includes("100%"), "99.9% 没有被四舍五入成 100%");
 assert(wide.includes("99.9%"), "99.9% 保留一位小数显示");
 
-// 耗尽预测结论行
-assert(wide.includes("重置时预计用到") && wide.includes("够用"), "月档安全投影给出「够用」结论");
-assert(wide.includes("用完"), "周档撞线投影给出「用完」结论");
+// 用量节奏结论行（主角口径：额度进度 vs 时间进度）
+assert(wide.includes("时间过了") && wide.includes("额度用了") && wide.includes("节奏正常"), "月档安全节奏给出「节奏正常」结论");
+assert(wide.includes("用完") && wide.includes("比重置早"), "周档撞线给出「预计用完，比重置早…」结论");
+// 旧的近期外推点估计文案已下线
+assert(!wide.includes("重置时预计用到"), "不再出现「重置时预计用到 X%」的伪精确文案");
 
 // 账号切换器：头部 <select>，多账号
 const selects = wideEl.querySelectorAll("select");

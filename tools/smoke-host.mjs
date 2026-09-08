@@ -412,22 +412,24 @@ assert(ALLOWED_REFRESH_MS.length === 5, "刷新档位共 5 个");
 {
   const T = 1_700_000_000_000;
   const DAY = 86400000;
-  // 24 小时月度用掉 4 个百分点 → 4%/天
+  // 三点（-48h:10 基线、-23h:16 窗口内、现在:20）最小二乘斜率 ≈ 5%/天；
+  // 窗口内每个观测都参与回归（抗突发能力见下方 burst 用例）
   const snaps = [
     { t: T - 2 * DAY, p: { monthly: 10, weekly: 10, session: 0 } },
-    { t: T - DAY, p: { monthly: 16, weekly: 20, session: 0 } }
+    { t: T - 23 * 3600000, p: { monthly: 16, weekly: 20, session: 0 } }
   ];
   const r = burnRate(snaps, "monthly", 20, T);
   assert(r !== null, "burnRate：样本充足返回结果");
-  assert(Math.abs(r.perDay - 4) < 1e-9, "burnRate：24 小时用 4 点 → 4%/天");
+  assert(Math.abs(r.perDay - 5) < 0.1, "burnRate：三点 OLS 斜率 ≈ 5%/天");
+  assert(r.samples === 3, "burnRate：样本数 = 两条快照 + 当前水位");
   assert(Math.abs(r.budgetPerDay - 100 / 30) < 1e-9, "burnRate：月度预算速率 = 100%/30 天");
-  assert(r.ratio > 1, "burnRate：4%/天 快于预算 → 倍率 > 1");
+  assert(r.ratio > 1, "burnRate：5%/天 快于预算 → 倍率 > 1");
   assert(r.status === "warn", "burnRate：无投影时 1.0~1.5 倍判为偏快");
-  assert(Math.abs(r.exhaustAt - (T + 20 * DAY)) < 1000, "burnRate：剩余 80% 按 4%/天 → 20 天后耗尽");
+  assert(Math.abs(r.exhaustAt - (T + 16 * DAY)) < DAY, "burnRate：剩余 80% 按 5%/天 → 约 16 天后耗尽");
   // 样本不足
   assert(burnRate([], "monthly", 50, T) === null, "burnRate：没有快照返回 null");
-  assert(burnRate([{ t: T - 30000, p: { monthly: 10 } }], "monthly", 11, T) === null, "burnRate：观测不足 2 分钟返回 null");
-  // 周期重置导致百分比回落（98% → 3%）→ 不当负消耗
+  assert(burnRate([{ t: T - 30000, p: { monthly: 10 } }], "monthly", 11, T) === null, "burnRate：观测跨度不足月档最小跨度（6 小时）返回 null");
+  // 周期重置导致百分比回落（98% → 3%）→ OLS 截断后只剩当前点，不当负消耗
   assert(burnRate([{ t: T - DAY, p: { monthly: 98 } }], "monthly", 3, T) === null, "burnRate：百分比回落（换周期）返回 null");
   // 已用满时无耗尽时间
   const full = burnRate([{ t: T - DAY, p: { monthly: 90 } }], "monthly", 100, T);
@@ -436,30 +438,47 @@ assert(ALLOWED_REFRESH_MS.length === 5, "刷新档位共 5 个");
   const sess = burnRate([{ t: T - 3600000, p: { session: 0 } }], "session", 10, T);
   assert(sess !== null && Math.abs(sess.budgetPerDay - (100 / (5 * 3600000)) * DAY) < 1e-6, "burnRate：session 用 5 小时周期");
 
-  // ── 重置对齐投影 ──
-  // 4%/天，重置在 10 天后：投影 = 20 + 4×10 = 60%；月度周期 30 天 → 时间进度 2/3。
+  // ── 节奏投影（主角口径：额度进度 ÷ 时间进度）──
+  // 重置在 10 天后：时间进度 = 1 - 10/30 = 2/3；额度进度 0.2 ÷ 2/3 = 0.3
+  // → 平均节奏投影 30%（时间过了三分之二才用五分之一，非常安全）。
   const proj = burnRate(snaps, "monthly", 20, T, (T + 10 * DAY) / 1000);
-  assert(Math.abs(proj.projectedAtReset - 60) < 1e-9, "burnRate：投影 = 当前水位 + 速率×剩余时间");
   assert(Math.abs(proj.timeProgress - (1 - 10 / 30)) < 1e-9, "burnRate：时间进度 = 1 - 剩余/周期");
   assert(Math.abs(proj.quotaProgress - 0.2) < 1e-9, "burnRate：额度进度 = 当前已用比例");
-  assert(proj.status === "ok", "burnRate：投影 60% < 85% 判 ok（投影优先于倍率）");
-  // 水位高、倍率低但撑不到重置：95% + 1%/天×10 天 = 105% → over
+  assert(Math.abs(proj.paceRatio - 0.3) < 1e-9, "burnRate：平均倍率 = 额度进度 ÷ 时间进度");
+  assert(Math.abs(proj.projectedAtReset - 30) < 1e-9, "burnRate：节奏投影 = 额度进度 ÷ 时间进度 × 100");
+  assert(proj.status === "ok", "burnRate：投影 30% < 85% 判 ok（投影优先于近期倍率）");
+  // 时间过了 2/3、额度已用 95%：平均节奏投影 = 95 ÷ (2/3) = 142.5% → over
   const willHit = burnRate([{ t: T - DAY, p: { monthly: 94 } }], "monthly", 95, T, (T + 10 * DAY) / 1000);
-  assert(Math.abs(willHit.projectedAtReset - 105) < 1e-9, "burnRate：撞线投影 = 105%");
-  assert(willHit.status === "over", "burnRate：投影 ≥100% 判 over，即使倍率 <1");
-  assert(willHit.exhaustAt !== null && willHit.exhaustAt < (T + 10 * DAY), "burnRate：撞线时耗尽时刻早于重置");
-  // 85%~100% → warn
-  const tight = burnRate([{ t: T - DAY, p: { monthly: 84 } }], "monthly", 85, T, (T + 10 * DAY) / 1000);
+  assert(Math.abs(willHit.projectedAtReset - 142.5) < 1e-9, "burnRate：撞线投影 = 142.5%");
+  assert(willHit.status === "over", "burnRate：投影 ≥100% 判 over");
+  assert(willHit.exhaustAt !== null && willHit.exhaustAt < (T + 10 * DAY), "burnRate：近期速率耗尽时刻早于重置");
+  // 投影落在 85%~100% → warn：时间过了 2/3、额度用了 60% → 投影 90%
+  const tight = burnRate([{ t: T - DAY, p: { monthly: 59 } }], "monthly", 60, T, (T + 10 * DAY) / 1000);
+  assert(Math.abs(tight.projectedAtReset - 90) < 1e-9, "burnRate：60% ÷ (2/3) → 投影 90%");
   assert(tight.status === "warn", "burnRate：投影 85%~100% 判 warn");
+  // 周期刚起步（时间进度 <10%）：小分母让平均倍率失真，不下节奏结论，退回近期倍率
+  const early = burnRate(snaps, "monthly", 20, T, (T + 29 * DAY) / 1000);
+  assert(early.projectedAtReset === null && early.paceRatio === null, "burnRate：时间进度不足 10% 时节奏投影为 null");
+  assert(early.status === "warn", "burnRate：起步期状态退回近期倍率口径");
   // 重置时刻已过 → 无投影，退回倍率口径
   const past = burnRate(snaps, "monthly", 20, T, (T - 3600000) / 1000);
-  assert(past.projectedAtReset === null && past.timeProgress === null, "burnRate：重置时刻已过时投影为 null");
+  assert(past.projectedAtReset === null && past.timeProgress === null && past.paceRatio === null, "burnRate：重置时刻已过时投影为 null");
   assert(past.status === "warn", "burnRate：无投影时状态退回倍率口径");
   // 重置时刻比整周期还远 → 无投影
   const far = burnRate(snaps, "monthly", 20, T, (T + 40 * DAY) / 1000);
   assert(far.projectedAtReset === null, "burnRate：重置时刻超出周期+容差时投影为 null");
   // 不传 resetAt → 投影字段为 null
-  assert(r.projectedAtReset === null && r.timeProgress === null, "burnRate：不传 resetAt 时投影为 null");
+  assert(r.projectedAtReset === null && r.timeProgress === null && r.paceRatio === null, "burnRate：不传 resetAt 时投影为 null");
+
+  // ── OLS 抗突发：一次突发把水位拉起后长期持平，斜率不应被突发主导 ──
+  // 19 小时前 10% → 19%（突发），之后持平在 19.2%。
+  // 旧端点法（最早点 vs 当前）算成 (19.2-10)/20h ≈ 11%/天；OLS 摊薄后 ≈ 6.7%/天。
+  const burst = burnRate([
+    { t: T - 20 * 3600000, p: { monthly: 10 } },
+    { t: T - 19 * 3600000, p: { monthly: 19 } },
+    { t: T - 10 * 3600000, p: { monthly: 19.1 } }
+  ], "monthly", 19.2, T);
+  assert(burst.perDay < 9, "burnRate：突发后持平时 OLS 速率被摊薄（< 9%/天，端点法会给到 ~11%/天）");
 }
 
 // --- burnRatesFor：多周期，样本不足的周期不出现 ---
@@ -467,17 +486,18 @@ assert(ALLOWED_REFRESH_MS.length === 5, "刷新档位共 5 个");
   const T = 1_700_000_000_000;
   const DAY = 86400000;
   const rates = burnRatesFor(
-    { snapsByAccount: { a: [{ t: T - DAY, p: { monthly: 10 } }] } },
+    { snapsByAccount: { a: [{ t: T - DAY, p: { monthly: 79 } }] } },
     "a",
     [
-      { level: "monthly", percentUsed: 20, resetAt: (T + 10 * DAY) / 1000 },
+      { level: "monthly", percentUsed: 80, resetAt: (T + 10 * DAY) / 1000 },
       { level: "weekly", percentUsed: 5 }
     ],
     T
   );
-  assert(rates.monthly !== undefined, "burnRatesFor：有样本的 monthly 出速率");
-  assert(rates.weekly === undefined, "burnRatesFor：weekly 无样本不出现");
-  assert(Math.abs(rates.monthly.projectedAtReset - (20 + 10 * 10)) < 1e-9, "burnRatesFor：resetAt 透传，投影 = 120%");
+  assert(rates.monthly !== undefined, "burnRatesFor：有节奏的 monthly 出结果");
+  assert(rates.weekly === undefined, "burnRatesFor：weekly 无 resetAt 且无样本不出现");
+  // 平均节奏投影 = 80% ÷ (2/3 时间进度) = 120%
+  assert(Math.abs(rates.monthly.projectedAtReset - 120) < 1e-9, "burnRatesFor：resetAt 透传，平均节奏投影 = 120%");
   assert(rates.monthly.status === "over", "burnRatesFor：投影 120% 判 over");
 }
 
