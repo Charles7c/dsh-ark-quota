@@ -15,8 +15,10 @@ import {
   snapshotStatsState,
   mergeStatsState,
   isArkProvider,
+  isSameOriginRequest,
   foldSnap,
   foldSnapFor,
+  dropAccountSnaps,
   pruneSnaps,
   burnRate,
   burnRatesFor,
@@ -34,11 +36,13 @@ function assert(cond, msg) {
   }
 }
 
-function makeReq(method, url, json) {
+function makeReq(method, url, json, headers) {
   const text = json === undefined ? "" : JSON.stringify(json);
   const req = Readable.from([Buffer.from(text)]);
   req.method = method;
   req.url = url;
+  // 小写键，与 Node IncomingMessage.headers 形状一致。
+  req.headers = headers ? { ...headers } : {};
   return req;
 }
 
@@ -182,10 +186,10 @@ function multiConfig(extra = {}) {
   };
 }
 
-async function call(ctx, path, method, url, json) {
+async function call(ctx, path, method, url, json, headers) {
   const route = ctx.__routes.get(path);
   if (!route) return { res: { statusCode: 404 }, json: null, __missing: true };
-  const req = makeReq(method, url ?? path, json);
+  const req = makeReq(method, url ?? path, json, headers);
   const res = makeRes();
   await route.handler(req, res);
   const parsed = res.body ? JSON.parse(res.body) : null;
@@ -734,6 +738,133 @@ assert(ALLOWED_REFRESH_MS.length === 5, "刷新档位共 5 个");
   apply(bare, multiConfig());
   await new Promise((r) => setTimeout(r, 20));
   assert(bare.__openedSpec() === null, "无 storageDomain 时不开域，插件不报错");
+}
+
+// --- 跨站请求防护：POST 路由只接受同源调用 ---
+{
+  // 纯函数判定
+  assert(isSameOriginRequest({ headers: { "sec-fetch-site": "same-origin" } }) === true, "Sec-Fetch-Site: same-origin 放行");
+  assert(isSameOriginRequest({ headers: { "sec-fetch-site": "none" } }) === true, "Sec-Fetch-Site: none 放行");
+  assert(isSameOriginRequest({ headers: { "sec-fetch-site": "cross-site" } }) === false, "Sec-Fetch-Site: cross-site 拒绝");
+  assert(isSameOriginRequest({ headers: { "sec-fetch-site": "same-site" } }) === false, "Sec-Fetch-Site: same-site（别的 localhost 端口）拒绝");
+  assert(isSameOriginRequest({ headers: {} }) === true, "无任何头（curl 等非浏览器客户端）放行");
+  assert(isSameOriginRequest({}) === true, "headers 缺失也不抛错");
+  assert(isSameOriginRequest({ headers: { origin: "http://evil.example", host: "127.0.0.1:3080" } }) === false,
+    "旧浏览器兜底：Origin 主机与 Host 不一致 → 拒绝");
+  assert(isSameOriginRequest({ headers: { origin: "http://127.0.0.1:3080", host: "127.0.0.1:3080" } }) === true,
+    "旧浏览器兜底：Origin 与 Host 一致 → 放行");
+  assert(isSameOriginRequest({ headers: { origin: "not a url" } }) === false, "Origin 非法 URL → 拒绝");
+
+  // 路由级：三个会写配置的 POST 都拦
+  const ctx = mockCtx();
+  apply(ctx, multiConfig());
+  const xsite = { "sec-fetch-site": "cross-site" };
+  const same = { "sec-fetch-site": "same-origin" };
+  const r1 = await call(ctx, "/ark-quota/settings", "POST", "/ark-quota/settings", { refreshMs: 60000 }, xsite);
+  assert(r1.res.statusCode === 403 && r1.json.code === "cross-origin", "cross-site POST /settings → 403");
+  const r2 = await call(ctx, "/ark-quota/credentials", "POST", "/ark-quota/credentials",
+    { account: "personal", accessKeyId: "a", secretAccessKey: "b" }, xsite);
+  assert(r2.res.statusCode === 403 && r2.json.code === "cross-origin", "cross-site POST /credentials → 403");
+  const r3 = await call(ctx, "/ark-quota/accounts", "POST", "/ark-quota/accounts",
+    { action: "activate", id: "personal" }, xsite);
+  assert(r3.res.statusCode === 403 && r3.json.code === "cross-origin", "cross-site POST /accounts → 403");
+  // 同源请求不受影响
+  const okSettings = await call(ctx, "/ark-quota/settings", "POST", "/ark-quota/settings", { refreshMs: 60000 }, same);
+  assert(okSettings.res.statusCode === 200, "same-origin POST /settings 正常 200");
+  const okActivate = await call(ctx, "/ark-quota/accounts", "POST", "/ark-quota/accounts",
+    { action: "activate", id: "personal" }, same);
+  assert(okActivate.res.statusCode === 200, "same-origin POST /accounts 正常 200");
+  // 被跨站拦掉的 activate 没有生效
+  const status = await call(ctx, "/ark-quota/status", "GET", "/ark-quota/status");
+  assert(status.json.activeAccountId === "personal", "被 403 拦掉的写请求没有改动配置");
+}
+
+// --- dropAccountSnaps：删账号清快照桶（纯函数）---
+{
+  const state = { snapsByAccount: { a: [{ t: 1, p: { monthly: 1 } }], b: [{ t: 2, p: {} }] } };
+  const next = dropAccountSnaps(state, "a");
+  assert(!Object.prototype.hasOwnProperty.call(next.snapsByAccount, "a"), "dropAccountSnaps：目标桶被删除");
+  assert(Object.prototype.hasOwnProperty.call(next.snapsByAccount, "b"), "dropAccountSnaps：其他账号的桶保留");
+  assert(state.snapsByAccount.a !== undefined, "dropAccountSnaps：不改原状态（纯函数）");
+  assert(dropAccountSnaps(state, "ghost") === state, "dropAccountSnaps：目标不存在时原样返回");
+  const empty = {};
+  assert(dropAccountSnaps(empty, "a") === empty, "dropAccountSnaps：空态也安全");
+}
+
+// --- noPlan：两个套餐接口都成功但没有额度行 → noPlan=true ---
+{
+  const orig = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    status: 200,
+    async text() { return JSON.stringify({ ResponseMetadata: {}, Result: {} }); }
+  });
+  try {
+    const ctx = mockCtx();
+    apply(ctx, {
+      accessKeyId: "ak", secretAccessKey: "sk",
+      region: "cn-beijing", version: "2024-01-01", refreshMs: 300000
+    });
+    const r = await call(ctx, "/ark-quota", "GET", "/ark-quota");
+    assert(r.res.statusCode === 200 && r.json.ok === true, "空额度仍是 200 ok");
+    assert(Array.isArray(r.json.quota) && r.json.quota.length === 0, "quota 为空数组");
+    assert(r.json.noPlan === true, "两个套餐都无额度行 → noPlan=true");
+  } finally {
+    globalThis.fetch = orig;
+  }
+}
+
+// --- single-flight：缓存过期瞬间的并发请求只打一次上游 ---
+{
+  const orig = globalThis.fetch;
+  let fetches = 0;
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  globalThis.fetch = async () => {
+    fetches += 1;
+    await gate;
+    return { status: 200, async text() { return JSON.stringify(codingBody); } };
+  };
+  try {
+    const ctx = mockCtx();
+    apply(ctx, {
+      accessKeyId: "ak", secretAccessKey: "sk",
+      region: "cn-beijing", version: "2024-01-01", refreshMs: 300000
+    });
+    // 先让三个请求都飞起来（共享同一个在途 Promise），再放行闸门。
+    const pending = Promise.all([
+      call(ctx, "/ark-quota", "GET", "/ark-quota"),
+      call(ctx, "/ark-quota", "GET", "/ark-quota"),
+      call(ctx, "/ark-quota", "GET", "/ark-quota?account=default")
+    ]);
+    release();
+    const results = await pending;
+    assert(fetches === 1, "3 个并发冷请求只触发 1 次上游调用（实际 " + fetches + "）");
+    assert(results.every((r) => r.json && r.json.ok === true), "3 个并发等待者都拿到了额度数据");
+  } finally {
+    globalThis.fetch = orig;
+  }
+}
+
+// --- 删账号：快照桶随账号一起落盘清除 ---
+{
+  const orig = globalThis.fetch;
+  globalThis.fetch = async () => ({ status: 200, async text() { return JSON.stringify(codingBody); } });
+  try {
+    const ctx = mockCtx();
+    apply(ctx, multiConfig());
+    // 先给 personal 拉一次额度（记快照），等落盘节流（STATS_FLUSH_MS=2s）写下去。
+    await call(ctx, "/ark-quota", "GET", "/ark-quota?account=personal");
+    await new Promise((r) => setTimeout(r, 2300));
+    const before = ctx.__stored();
+    assert(before?.snapsByAccount?.personal !== undefined, "删除前：personal 的快照桶已落盘");
+    // 删除账号，再等一个落盘周期。
+    await call(ctx, "/ark-quota/accounts", "POST", "/ark-quota/accounts", { action: "remove", id: "personal" });
+    await new Promise((r) => setTimeout(r, 2300));
+    const after = ctx.__stored();
+    assert(after?.snapsByAccount?.personal === undefined, "删除后：personal 的快照桶已从落盘态清除");
+  } finally {
+    globalThis.fetch = orig;
+  }
 }
 
 if (failed) {

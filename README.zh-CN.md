@@ -4,7 +4,7 @@
 
 **火山方舟（Volcano Ark）Coding Plan 订阅套餐剩余额度** —— DeepSeek Harness（DSH）Web 插件，在侧边栏底部以固定小组件实时展示你的套餐额度，无需离开 DSH 界面。
 
-> 当前版本：`v0.1.3`（版本号见 [VERSION](./VERSION)）
+> 当前版本：`v0.1.4`（版本号见 [VERSION](./VERSION)）
 
 - 宿主半区（`lib/index.js`）：由于 OpenAPI 网关不允许来自 DSH 源（127.0.0.1:3080）的跨域（CORS）请求，由宿主用你的火山引擎**访问密钥 AK/SK**（SigV4 变体签名）在同源路由 `/ark-quota` 上代理控制面 OpenAPI `GetCodingPlanUsage`（未订阅时自动回落到 Agent Plan 的 `GetAFPUsage`）。**无浏览器、无 Cookie、无 CSRF**。
 - 浏览器半区（`lib/client.js`）：渲染额度卡片 / 窄条百分比胶囊，并在设置变更时自动刷新；同时在 **设置 → 方舟额度** 提供独立的顶级配置分区，可直接在 DSH 设置界面粘贴 AK/SK。
@@ -48,7 +48,7 @@
      - 'node_modules/dsh-ark-quota'
    ```
 
-   随后在 profile 目录运行 `pnpm install`。如果你的 harness 已提供 profile 的依赖（例如 `npx` 安装方式的 `$DSH_HOME/profiles/node_modules` 模块回退），`pnpm install` 可省略——本包的依赖（`@deepseek-ai/schemastery`、`yaml`）已可直接解析，放好包即可。
+   随后在 profile 目录运行 `pnpm install`。如果你的 harness 已提供 profile 的依赖（例如 `npx` 安装方式的 `$DSH_HOME/profiles/node_modules` 模块回退），`pnpm install` 可省略——本包的依赖（`@deepseek-ai/schemastery`、`zod`）已可直接解析，放好包即可。
 
 3. 在 profile 的 `cordis.patch.yml` 中加入条目：
 
@@ -153,7 +153,7 @@
 
 ## 安全说明
 
-- `/ark-quota`、`/ark-quota/status`、`/ark-quota/providers`、`/ark-quota/accounts`、`/ark-quota/credentials`、`/ark-quota/settings` 这些路由**仅限本机**（绑定在 DSH 服务上）且**无鉴权**：同一台机器上的任何进程都能读取你的额度数据、触发一次带鉴权的刷新、通过 `POST /ark-quota/credentials` 覆盖访问密钥、通过 `POST /ark-quota/accounts` 增删账号，或通过 `POST /ark-quota/settings` 修改轮询间隔（影响面等同本机可直接读写 `settings.yaml`）。但它们**绝不会回显你的访问密钥**（响应只含布尔状态 / 额度数字 / 账号 id 与标签）；`/ark-quota/credentials` 只接受固定形状的 `account` / `accessKeyId` / `secretAccessKey` 字段，`/ark-quota/accounts` 只接受固定的 action 加 id、标签与提供方 id 列表，`/ark-quota/settings` 只接受固定白名单中的 `refreshMs` 数值，都不接受任何用户可控的 URL，因此无法作为代理/SSRF 跳板或泄漏火山凭据。插件加载期间请勿将 DSH 服务暴露到非回环地址。
+- `/ark-quota`、`/ark-quota/status`、`/ark-quota/providers`、`/ark-quota/accounts`、`/ark-quota/credentials`、`/ark-quota/settings` 这些路由**仅限本机**（绑定在 DSH 服务上）且**无鉴权**：同一台机器上的任何进程都能读取你的额度数据、触发一次带鉴权的刷新、通过 `POST /ark-quota/credentials` 覆盖访问密钥、通过 `POST /ark-quota/accounts` 增删账号，或通过 `POST /ark-quota/settings` 修改轮询间隔（影响面等同本机可直接读写 `settings.yaml`）。三个会写配置的 POST 路由带有**同源校验**：浏览器发来的跨站表单 POST（你开着 DSH 时访问的其他网页也能向本地端口发请求）会按 `Sec-Fetch-Site` / `Origin` 头拦下（403），本机进程直连（curl 等）不受影响。但它们**绝不会回显你的访问密钥**（响应只含布尔状态 / 额度数字 / 账号 id 与标签）；`/ark-quota/credentials` 只接受固定形状的 `account` / `accessKeyId` / `secretAccessKey` 字段，`/ark-quota/accounts` 只接受固定的 action 加 id、标签与提供方 id 列表，`/ark-quota/settings` 只接受固定白名单中的 `refreshMs` 数值，都不接受任何用户可控的 URL，因此无法作为代理/SSRF 跳板或泄漏火山凭据。插件加载期间请勿将 DSH 服务暴露到非回环地址。
 - 访问密钥是真实凭据，存放于 `$DSH_HOME` 下的 `cordis.patch.yml` / `settings.yaml`；在设置 schema 中以 `role('secret')` 声明（DSH 设置界面以只写字段展示、绝不把值回传浏览器），并**已被 git 排除**（见 `.gitignore`）。
 - `tools/check.mjs` 只用命令行 / `ARK_AK` / `ARK_SK` 传入的密钥签名一次请求，**不写盘、不全量打印**。
 

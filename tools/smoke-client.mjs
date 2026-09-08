@@ -181,6 +181,72 @@ assert(!!document.querySelector('input[name="ark-decoy-password"]'), "存在防�
 const statsCalls = calls.filter((u) => u.startsWith("/ark-quota/stats"));
 assert(statsCalls.length === 0, "客户端不再请求 /ark-quota/stats（实际 " + statsCalls.length + " 次）");
 
+// rail 药丸不再是死按钮：aria-label 说明点击行为，点击不抛错
+const railBtn = document.getElementById("rail").querySelector("button");
+assert(!!railBtn, "rail 药丸渲染为 button");
+assert((railBtn.getAttribute("aria-label") || "").includes("展开侧边栏"), "正常态 rail 按钮 aria-label 提示展开侧边栏");
+railBtn.click();
+assert(true, "点击 rail 药丸不抛错（无宿主按钮时静默降级）");
+
+// 标签页切回前台 → 补一次拉取（后台定时器会被浏览器节流）
+{
+  // jsdom 默认 visibilityState 为 "hidden"，这里模拟浏览器里前台标签页的状态。
+  Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "visible" });
+  const before = calls.filter((u) => u.startsWith("/ark-quota?") || u === "/ark-quota").length;
+  document.dispatchEvent(new dom.window.Event("visibilitychange"));
+  await wait(200);
+  const after = calls.filter((u) => u.startsWith("/ark-quota?") || u === "/ark-quota").length;
+  assert(after > before, "visibilitychange 回到前台触发一次额度拉取（" + before + " → " + after + "）");
+}
+
+// noPlan：两个套餐都无额度 → 明确提示未订阅，而不是含糊的「暂无额度数据」
+{
+  const standardFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.startsWith("/ark-quota/status")) {
+      return { json: async () => ({ ok: true, configured: true, refreshMs: 300000, activeAccountId: "personal", accounts }), status: 200 };
+    }
+    if (u.startsWith("/ark-quota/providers")) {
+      return { json: async () => ({ ok: true, providers: [], claimed: {}, foreignClaimed: [], filtered: 0 }), status: 200 };
+    }
+    // 额度接口：成功但空 quota + noPlan
+    return {
+      json: async () => ({ ok: true, plan: "coding-plan", refreshMs: 300000, cachedAt: Date.now(), accountId: "personal", accounts, quota: [], noPlan: true, burn: {} }),
+      status: 200
+    };
+  };
+  const np = document.createElement("div");
+  document.body.appendChild(np);
+  const npRoot = createRoot(np);
+  npRoot.render(React.createElement(widgetReg.Component, { wide: true }));
+  await wait(300);
+  assert(np.textContent.includes("未检测到方舟套餐订阅"), "noPlan 时提示未检测到套餐订阅");
+  assert(np.textContent.includes("检查账号设置"), "noPlan 空态给出检查设置的入口");
+  assert(!np.textContent.includes("暂无额度数据（"), "noPlan 时不再显示通用的「暂无额度数据」");
+
+  // 出错态 rail 药丸：点击行为指向设置
+  const errRail = document.createElement("div");
+  document.body.appendChild(errRail);
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.startsWith("/ark-quota") && !u.includes("/status") && !u.includes("/providers")) {
+      return { json: async () => ({ ok: false, code: "unauthorized", message: "访问密钥校验失败", accounts }), status: 401 };
+    }
+    return { json: async () => ({ ok: true, configured: false, refreshMs: 300000, accounts, activeAccountId: "personal", providers: [], claimed: {}, foreignClaimed: [], filtered: 0 }), status: 200 };
+  };
+  const errRoot = createRoot(errRail);
+  errRoot.render(React.createElement(widgetReg.Component, { wide: false }));
+  await wait(300);
+  const errBtn = errRail.querySelector("button");
+  assert(!!errBtn && errBtn.textContent === "!", "出错态 rail 药丸显示 !");
+  assert((errBtn.getAttribute("aria-label") || "").includes("打开设置"), "出错态 rail 按钮 aria-label 提示打开设置");
+  let clickThrew = false;
+  try { errBtn.click(); } catch (e) { clickThrew = true; }
+  assert(clickThrew === false && errRail.querySelector("button") === errBtn, "出错态点击不抛错、组件不崩");
+  globalThis.fetch = standardFetch;
+}
+
 console.log("\nfetch 调用：", [...new Set(calls)].join(", "));
 // React 的轮询 setTimeout / useNow setInterval 会让事件循环不空，必须显式退出。
 process.exit(failed > 0 ? 1 : 0);

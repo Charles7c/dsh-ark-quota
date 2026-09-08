@@ -4,7 +4,7 @@
 
 A [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) (DSH) web plugin that shows your **火山方舟 (Volcano Ark) Coding Plan subscription quota** as a fixed widget in the sidebar footer — without ever leaving the DSH GUI.
 
-> Current version: `v0.1.3` (see [VERSION](./VERSION))
+> Current version: `v0.1.4` (see [VERSION](./VERSION))
 
 - Host half (`lib/index.js`) signs the **control-plane OpenAPI** `GetCodingPlanUsage` (falling back to `GetAFPUsage` for Agent Plan) with your Volcengine **AK/SK** (SigV4 variant) behind a same-origin route (`/ark-quota`), because the OpenAPI gateway does not allow CORS from the DSH origin. No browser, no cookies, no CSRF.
 - Browser half (`lib/client.js`) renders the quota card / rail pill and auto-refreshes when the settings change; a dedicated **Settings → 方舟额度** section lets you paste the AK/SK straight into the DSH settings UI.
@@ -54,7 +54,7 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) (DSH) web 
    Then run `pnpm install` in the profile directory. If your harness already provides the
    profile's dependencies (e.g. the `$DSH_HOME/profiles/node_modules` module fallback of an
    `npx`-installed harness), `pnpm install` is optional — the package's deps
-   (`@deepseek-ai/schemastery`) already resolve, so placing the package is enough.
+   (`@deepseek-ai/schemastery`, `zod`) already resolve, so placing the package is enough.
 
 3. Add an entry to your profile's `cordis.patch.yml`:
 
@@ -166,7 +166,7 @@ On failure: `{ "ok": false, "code": "unauthorized" | "missing-auth" | "unknown-a
 
 ## Security notes
 
-- The `/ark-quota`, `/ark-quota/status`, `/ark-quota/providers`, `/ark-quota/accounts`, `/ark-quota/credentials`, and `/ark-quota/settings` routes are **localhost-only** (bound to the DSH server) and are **unauthenticated**: any process on the same machine can read your quota figures, force an authenticated refresh, overwrite your access keys via `POST /ark-quota/credentials`, add/remove accounts via `POST /ark-quota/accounts`, or change the `refreshMs` polling cadence via `POST /ark-quota/settings` (the same exposure as directly editing `settings.yaml` on that machine). They **never echo your access keys** (responses carry only booleans / quota numbers / account ids and labels); `/ark-quota/credentials` accepts only a fixed-shape `account` / `accessKeyId` / `secretAccessKey` triple of strings, `/ark-quota/accounts` only a fixed action plus an id, label, and provider-id list, and `/ark-quota/settings` only `refreshMs` from a fixed allowlist — no user-controlled URL, so they cannot be used as a proxy/SSRF vector or leak the Volcengine credentials. Don't expose the DSH server beyond loopback while this plugin is loaded.
+- The `/ark-quota`, `/ark-quota/status`, `/ark-quota/providers`, `/ark-quota/accounts`, `/ark-quota/credentials`, and `/ark-quota/settings` routes are **localhost-only** (bound to the DSH server) and are **unauthenticated**: any process on the same machine can read your quota figures, force an authenticated refresh, overwrite your access keys via `POST /ark-quota/credentials`, add/remove accounts via `POST /ark-quota/accounts`, or change the `refreshMs` polling cadence via `POST /ark-quota/settings` (the same exposure as directly editing `settings.yaml` on that machine). The three state-changing POST routes additionally enforce a **same-origin check**: cross-site form POSTs from other web pages you happen to visit while DSH is running are rejected (403) based on the `Sec-Fetch-Site` / `Origin` headers, while same-machine clients like curl are unaffected. They **never echo your access keys** (responses carry only booleans / quota numbers / account ids and labels); `/ark-quota/credentials` accepts only a fixed-shape `account` / `accessKeyId` / `secretAccessKey` triple of strings, `/ark-quota/accounts` only a fixed action plus an id, label, and provider-id list, and `/ark-quota/settings` only `refreshMs` from a fixed allowlist — no user-controlled URL, so they cannot be used as a proxy/SSRF vector or leak the Volcengine credentials. Don't expose the DSH server beyond loopback while this plugin is loaded.
 - Access keys are real credentials. They are stored in `cordis.patch.yml` / `settings.yaml` under `$DSH_HOME`, declared with `role('secret')` in the settings schema (the DSH settings UI shows them as write-only fields and never sends their values back to the browser), and are **excluded from git** (see `.gitignore`).
 - `tools/check.mjs` only signs one request with the keys you pass on the command line / via `ARK_AK`/`ARK_SK`; it never writes them to disk and never prints them in full.
 
