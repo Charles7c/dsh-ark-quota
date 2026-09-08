@@ -76,16 +76,19 @@ globalThis.fetch = async (url, opts) => {
       ],
       burn: {
         monthly: {
-          // 平均节奏投影（主角）：额度进度 23% ÷ 时间进度 33% = 0.7× → 投影 69%，正常
+          // 月档固定走平均口径：额度进度 23% ÷ 时间进度 33% = 0.7× → 投影 69%，正常
           perDay: 3.2, budgetPerDay: 3.33, ratio: 0.96, paceRatio: 0.7, trendRatio: 1.37, status: "ok",
           exhaustAt: Date.now() + 20 * 86400000,
-          projectedAtReset: 69, timeProgress: 0.33, quotaProgress: 0.23, sampleMs: 86400000, samples: 14
+          projectedAtReset: 69, forecast: 69, forecastBasis: "average",
+          timeProgress: 0.33, quotaProgress: 0.23, sampleMs: 86400000, samples: 14
         },
         weekly: {
-          // 平均节奏投影 140% → 撞线；短期档给预计用完时刻
+          // 平均节奏投影 140%；近期样本充足（8 个）→ forecast 走近期口径 200%，
+          // 按近期速度 12 小时后用完（比重置早）
           perDay: 40, budgetPerDay: 14.3, ratio: 2.8, paceRatio: 1.4, trendRatio: 2.0, status: "over",
           exhaustAt: Date.now() + 12 * 3600000,
-          projectedAtReset: 140, timeProgress: 0.57, quotaProgress: 0.8, sampleMs: 12 * 3600000, samples: 8
+          projectedAtReset: 140, recentProjected: 200, forecast: 200, forecastBasis: "recent",
+          timeProgress: 0.57, quotaProgress: 0.8, sampleMs: 12 * 3600000, samples: 8
         }
       }
     };

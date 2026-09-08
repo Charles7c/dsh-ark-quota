@@ -76,7 +76,53 @@ function mk(level, arr) {
   assert(r.agingPerDay === null, "固定周期档不算老化速率");
 }
 
-// ── 6. foldSnap 采样与 migrate 不回归 ───────────────────────────
+// ── 6. 近期停用时，预测以近期势头为准，不被平均口径带飞 ────────────
+{
+  const now = Date.now();
+  // 6a：周周期过了 15%、额度用了 2%（平均投影 13%），但近 12 小时水位
+  // 几乎不动（样本充足、≈0.1%/天）→ forecast 应停在 3% 左右、口径 recent。
+  const resetA = Math.floor((now + 5.95 * DAY) / 1000);
+  const snapsA = mk("weekly", [[700, 1.9], [620, 1.94], [500, 1.97], [380, 1.99], [240, 2.0], [120, 2.0], [0, 2.0]]);
+  const ra = burnRate(snapsA, "weekly", 2, now, resetA);
+  assert(Math.abs(ra.projectedAtReset - 13.3) < 1, "平均投影 ≈13%，实际 " + Math.round(ra.projectedAtReset));
+  assert(ra.forecastBasis === "recent" && ra.forecast < 6, "forecast 走近期口径停在低位（≈3%），实际 " + (ra.forecast || 0).toFixed(1));
+  assert(ra.status === "ok", "已停用 → 状态 ok");
+  // 6b：周周期过半用了 80%（平均投影 160% → over），但近 12 小时已停用
+  //（样本充足、≈1%/天）→ 近期外推 ≈84% 不会撞线，状态降回 ok。
+  const resetB = Math.floor((now + 3.5 * DAY) / 1000);
+  const snapsB = mk("weekly", [[700, 79.3], [620, 79.5], [500, 79.7], [380, 79.8], [240, 79.9], [120, 79.95], [0, 80]]);
+  const rb = burnRate(snapsB, "weekly", 80, now, resetB);
+  assert(rb.projectedAtReset >= 150, "平均口径投影 ≥150%（" + Math.round(rb.projectedAtReset) + "%）");
+  assert(rb.forecastBasis === "recent" && rb.forecast < 88, "forecast ≈84% 不会撞线，实际 " + (rb.forecast || 0).toFixed(1));
+  assert(rb.status === "ok", "近期明显放缓 → 状态降为 ok，不被平均口径误报 over（实际 " + rb.status + "）");
+  // 6c：同样 80% 水位但近期只有 1 个基线点（样本 2，不可信）→ 保守保持
+  // 平均口径 over，不被两点巧合解除告警。
+  const rc = burnRate(mk("weekly", [[240, 79], [0, 80]]), "weekly", 80, now, resetB);
+  assert(rc.forecastBasis === "average" && rc.status === "over",
+    "近期样本不足 → 保守保持平均口径 over（basis=" + rc.forecastBasis + "，status=" + rc.status + "）");
+}
+
+// ── 7. 滑窗预测段按净增速外推到重置，不画理论稳态 ─────────────────
+{
+  const now = Date.now();
+  // 已用 35%、25 分钟后重置；近期 18%/时，老化按预算 20%/时（先验）→
+  // 净增速为负，host 不给 exhaustAt；客户端预测段也不应延伸（无 netPerDay>0）。
+  const snaps = mk("session", [[25, 28], [15, 31], [5, 33], [0, 35]]);
+  const r = burnRate(snaps, "session", 35, now, Math.floor((now + 25 * 60000) / 1000));
+  // 近期斜率 ≈(35-28)/(25min)=16.8%/时 < 预算 20%/时 → 净额 ≤ 0。
+  assert(r.netPerDay !== null && r.netPerDay <= 0.05, "低速使用净增速 ≈ 0，实际 " + Math.round(r.netPerDay));
+  assert(r.exhaustAt === null, "净增速 ≤ 0 → 无用完时刻（不会画到 88% 稳态）");
+  // 猛烧场景：窗口前（60~30 分钟前）很闲 ≈8%/时，近期半小时烧到 40%
+  //（≈60%/时）→ 净增速为正、给用完时刻；外推 1 小时的水位远低于
+  // inflow/aging 的理论稳态（旧逻辑会画到 100% 贴边）。
+  const hot = mk("session", [[60, 4], [50, 5], [40, 6], [30, 8], [20, 18], [10, 29], [0, 40]]);
+  const rh = burnRate(hot, "session", 40, now, Math.floor((now + 3600000) / 1000));
+  assert(rh.netPerDay > 0 && rh.exhaustAt !== null, "猛烧且老化低 → 净增速为正、给用完时刻");
+  const projected = 40 + rh.netPerDay / 24 * 1;
+  assert(projected < 100, "净增速外推 1 小时后的水位（" + Math.round(projected) + "%）远低于理论稳态");
+}
+
+// ── 7. foldSnap 采样与 migrate 不回归 ───────────────────────────
 {
   const now = Date.now();
   let snaps = [];
