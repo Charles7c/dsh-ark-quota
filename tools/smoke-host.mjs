@@ -11,6 +11,12 @@ import {
   ALLOWED_REFRESH_MS,
   migrateAccounts,
   resolveActiveAccountId,
+  accountIdFromRoute,
+  accountForRoute,
+  ensureRouteAccount,
+  detachRoute,
+  clearRouteCredentials,
+  findAccountByKeys,
   migrateStatsState,
   snapshotStatsState,
   mergeStatsState,
@@ -250,24 +256,100 @@ assert(ALLOWED_REFRESH_MS.length === 5, "刷新档位共 5 个");
   apply(ctx, multiConfig());
   const empty = await call(ctx, "/ark-quota/credentials", "POST", "/ark-quota/credentials", {});
   assert(empty.res.statusCode === 400 && empty.json.code === "noop", "空 body / 无密钥字段 → 400 noop");
+  // 路由维度写入：ark-coding-plan 已绑 personal，应直接更新该凭据组。
   const saved = await call(ctx, "/ark-quota/credentials", "POST", "/ark-quota/credentials", {
-    account: "personal",
+    route: "ark-coding-plan",
     accessKeyId: "  ak-new  ",
     secretAccessKey: "sk-new"
   });
-  assert(saved.res.statusCode === 200, "指定账号写入密钥 200");
-  assert(saved.json.accounts.find((a) => a.id === "personal").configured === true, "目标账号变为已配置");
+  assert(saved.res.statusCode === 200, "指定路由写入密钥 200");
+  assert(saved.json.accounts.find((a) => a.id === "personal").configured === true, "路由所属凭据组变为已配置");
+  assert(Array.isArray(saved.json.routes) && saved.json.routes.some((r) => r.route === "ark-coding-plan" && r.configured), "status 带出 routes 视图");
   assert(!JSON.stringify(saved.json).includes("ak-new") && !JSON.stringify(saved.json).includes("sk-new"), "响应不回显任何密钥");
+  // 旧的 account 入口仍可用（兼容）。
+  const byAccount = await call(ctx, "/ark-quota/credentials", "POST", "/ark-quota/credentials", {
+    account: "company", accessKeyId: "ak-company", secretAccessKey: "sk-company"
+  });
+  assert(byAccount.res.statusCode === 200, "account 入口（兼容）写入 200");
   const ghost = await call(ctx, "/ark-quota/credentials", "POST", "/ark-quota/credentials", {
     account: "ghost", accessKeyId: "a", secretAccessKey: "b"
   });
   assert(ghost.res.statusCode === 404, "写入未知账号 → 404");
-  // 一个账号都没有时自动建 default（首次配置顺手路径）
+  // 新路由首次绑定：自动建凭据组（id 由路由名清洗而来）。
   const fresh = mockCtx();
   apply(fresh, { refreshMs: 300000 });
-  const first = await call(fresh, "/ark-quota/credentials", "POST", "/ark-quota/credentials", { accessKeyId: "ak", secretAccessKey: "sk" });
-  assert(first.res.statusCode === 200, "空配置下首次保存 200");
-  assert(first.json.accounts.length === 1 && first.json.accounts[0].id === LEGACY_ACCOUNT_ID, "空配置自动创建 default 账号");
+  const first = await call(fresh, "/ark-quota/credentials", "POST", "/ark-quota/credentials",
+    { route: "ark-new-route", accessKeyId: "ak", secretAccessKey: "sk" });
+  assert(first.res.statusCode === 200, "空配置下按路由首次保存 200");
+  const created = first.json.accounts[0];
+  assert(created && created.id === accountIdFromRoute("ark-new-route"), "新路由自动建凭据组 id（" + accountIdFromRoute("ark-new-route") + "）");
+  assert(created.providers.includes("ark-new-route"), "新凭据组挂着该路由");
+  // 同 AK/SK 填给第二个路由 → 并入同一凭据组，不重复建组。
+  const same = await call(fresh, "/ark-quota/credentials", "POST", "/ark-quota/credentials",
+    { route: "ark-second-route", accessKeyId: "ak", secretAccessKey: "sk" });
+  assert(same.res.statusCode === 200, "同密钥第二个路由保存 200");
+  assert(same.json.accounts.length === 1, "同 AK/SK 并入同一凭据组（不新增账号）");
+  assert(same.json.accounts[0].providers.sort().join(",") === "ark-new-route,ark-second-route", "合并后两个路由同属一组");
+  // 无路由无账号的旧路径：自动建 default。
+  const legacy = mockCtx();
+  apply(legacy, { refreshMs: 300000 });
+  const leg = await call(legacy, "/ark-quota/credentials", "POST", "/ark-quota/credentials", { accessKeyId: "ak", secretAccessKey: "sk" });
+  assert(leg.res.statusCode === 200 && leg.json.accounts[0].id === LEGACY_ACCOUNT_ID, "无路由入口自动创建 default 账号");
+}
+
+// --- 路由维度纯函数：accountIdFromRoute / accountForRoute / ensure / detach / 去重 ---
+{
+  assert(accountIdFromRoute("ark-coding-plan") === "r_ark_coding_plan", "accountIdFromRoute：连字符→下划线并加 r_ 前缀");
+  assert(ACCOUNT_ID_RE.test(accountIdFromRoute("a.b-c!")), "accountIdFromRoute：清洗后仍合法");
+  const accs = migrateAccounts(multiConfig());
+  assert(accountForRoute(accs, "ark-coding-plan")?.id === "personal", "accountForRoute：路由反查到凭据组");
+  assert(accountForRoute(accs, "nope") === null, "accountForRoute：未知路由返回 null");
+  // ensureRouteAccount：已归属 → 原样；新路由 → 建组
+  const existed = ensureRouteAccount(accs, "ark-coding-plan");
+  assert(existed.accountId === "personal" && existed.accounts === accs, "ensureRouteAccount：已归属路由不重建");
+  const ensured = ensureRouteAccount(accs, "brand-new-route");
+  assert(ensured.accountId === "r_brand_new_route" && ensured.accounts.length === accs.length + 1, "ensureRouteAccount：新路由建新组");
+  assert(ensured.accounts.at(-1).providers[0] === "brand-new-route", "ensureRouteAccount：新组挂着路由");
+  // detachRoute：解绑后空且无密钥的组被清掉
+  const withRoute = ensureRouteAccount([], "lonely-route");
+  const detached = detachRoute(withRoute.accounts, "lonely-route");
+  assert(detached.removed === true && detached.droppedAccount === true && detached.accounts.length === 0, "detachRoute：空组（无密钥）被清掉");
+  const detachedKeep = detachRoute(accs, "ark-coding-plan");
+  assert(detachedKeep.droppedAccount === false, "detachRoute：有密钥的组解绑单条路由后组保留");
+  assert(detachedKeep.accounts.find((a) => a.id === "personal").providers.length === 0, "detachRoute：路由从组里移除");
+  // clearRouteCredentials：整组清除（AK/SK + 同账号所有路由）
+  const accs2 = migrateAccounts(multiConfig());
+  const cleared = clearRouteCredentials(accs2, "ark-coding-plan");
+  assert(cleared.removed === true && cleared.droppedAccount === true, "clearRouteCredentials：整组删除标记");
+  assert(cleared.accounts.every((a) => a.id !== "personal"), "clearRouteCredentials：personal 组被删除（AK/SK 一并清除）");
+  assert(clearRouteCredentials(accs2, "unbound-route").removed === false, "clearRouteCredentials：未绑定路由返回 removed=false");
+  // findAccountByKeys：同 AK/SK 命中
+  assert(findAccountByKeys(accs, "ak-personal", "sk-personal")?.id === "personal", "findAccountByKeys：同密钥命中");
+  assert(findAccountByKeys(accs, "ak-personal", "wrong-sk") === null, "findAccountByKeys：SK 不同不算同一账号");
+}
+
+// --- /ark-quota?route= 按路由查额度 ---
+{
+  const orig = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = async (_url, init) => {
+    const auth = String(init?.headers?.Authorization ?? "");
+    const m = /Credential=([^/,\s]+)/.exec(auth);
+    seen.push(m === null ? "?" : m[1]);
+    return { status: 200, async text() { return JSON.stringify(codingBody); } };
+  };
+  try {
+    const ctx = mockCtx();
+    apply(ctx, multiConfig());
+    const byRoute = await call(ctx, "/ark-quota", "GET", "/ark-quota?route=ark-coding-plan");
+    assert(byRoute.res.statusCode === 200 && byRoute.json.accountId === "personal", "?route= 反查到 personal 凭据组");
+    assert(seen[0] === "ak-personal", "?route= 用 personal 的 AK 签名");
+    const unbound = await call(ctx, "/ark-quota", "GET", "/ark-quota?route=unbound-route");
+    assert(unbound.res.statusCode === 404 && unbound.json.code === "unknown-account", "未绑定路由 → 404");
+    assert(Array.isArray(unbound.json.routes), "404 也带出 routes 视图");
+  } finally {
+    globalThis.fetch = orig;
+  }
 }
 
 // --- 配额 payload：clamp + cachedAt 毫秒 + 缓存命中不重复打上游 ---
@@ -673,43 +755,64 @@ assert(ALLOWED_REFRESH_MS.length === 5, "刷新档位共 5 个");
   assert(noSettings.json.providers.length === 2, "无 baseURL 时按名称特征仍筛出 2 个 ark- 路由");
 }
 
-// --- /ark-quota/accounts：add / remove / update / activate ---
+// --- /ark-quota/routes：pin / unbind / rename（旧 /accounts 已下线）---
 {
   const ctx = mockCtx();
   apply(ctx, multiConfig());
-  const added = await call(ctx, "/ark-quota/accounts", "POST", "/ark-quota/accounts", { action: "add", id: "team", label: "团队" });
-  assert(added.res.statusCode === 200, "accounts add：200");
-  assert(added.json.accounts.length === 3, "accounts add：账号数变 3");
-  assert(added.json.accounts.some((a) => a.id === "team" && a.configured === false), "accounts add：新账号未配密钥");
-  const badId = await call(ctx, "/ark-quota/accounts", "POST", "/ark-quota/accounts", { action: "add", id: "Bad-Id" });
-  assert(badId.res.statusCode === 400 && badId.json.code === "bad-id", "accounts add：非法 id → 400");
-  const dup = await call(ctx, "/ark-quota/accounts", "POST", "/ark-quota/accounts", { action: "add", id: "team" });
-  assert(dup.res.statusCode === 409 && dup.json.code === "duplicate", "accounts add：重复 id → 409");
-  // update：中文标签 + provider 去重去空
-  const updated = await call(ctx, "/ark-quota/accounts", "POST", "/ark-quota/accounts", {
-    action: "update", id: "team", label: "团队账号", providers: ["newapi-mo", "newapi-mo", ""]
-  });
-  const team = updated.json.accounts.find((a) => a.id === "team");
-  assert(team.label === "团队账号", "accounts update：中文标签已保存");
-  assert(team.providers.length === 1 && team.providers[0] === "newapi-mo", "accounts update：provider 去重去空");
-  // update 无有效字段 → 400
-  const noop = await call(ctx, "/ark-quota/accounts", "POST", "/ark-quota/accounts", { action: "update", id: "team" });
-  assert(noop.res.statusCode === 400 && noop.json.code === "noop", "accounts update：无 label/providers → 400");
-  // activate
-  const activated = await call(ctx, "/ark-quota/accounts", "POST", "/ark-quota/accounts", { action: "activate", id: "personal" });
-  assert(activated.json.activeAccountId === "personal", "accounts activate：当前账号切换");
-  // remove：删掉当前账号 → 回落
-  const removed = await call(ctx, "/ark-quota/accounts", "POST", "/ark-quota/accounts", { action: "remove", id: "personal" });
-  assert(removed.json.accounts.length === 2, "accounts remove：账号数减一");
-  assert(removed.json.activeAccountId !== "personal", "accounts remove：删掉当前账号后回落");
-  // 未知账号 / 非法 action
-  const ghost = await call(ctx, "/ark-quota/accounts", "POST", "/ark-quota/accounts", { action: "update", id: "ghost", label: "x" });
-  assert(ghost.res.statusCode === 404, "accounts update：未知账号 → 404");
-  const badAction = await call(ctx, "/ark-quota/accounts", "POST", "/ark-quota/accounts", { action: "nope", id: "team" });
-  assert(badAction.res.statusCode === 400 && badAction.json.code === "bad-action", "accounts：非法 action → 400");
-  const getRes = await call(ctx, "/ark-quota/accounts", "GET", "/ark-quota/accounts");
-  assert(getRes.res.statusCode === 405, "accounts：GET → 405");
-  assert(!JSON.stringify(removed.json).includes("ak-company"), "accounts：响应不泄露密钥");
+  // pin：固定到某路由（它必须已绑定凭据组）
+  const pinned = await call(ctx, "/ark-quota/routes", "POST", "/ark-quota/routes",
+    { action: "pin", route: "ark-coding-plan" });
+  assert(pinned.res.statusCode === 200, "routes pin：200");
+  assert(pinned.json.pinnedRoute === "ark-coding-plan" && pinned.json.activeAccountId === "personal", "routes pin：pinnedRoute 与默认账号更新");
+  // pin 未绑定路由 → 404
+  const pinGhost = await call(ctx, "/ark-quota/routes", "POST", "/ark-quota/routes",
+    { action: "pin", route: "no-such-route" });
+  assert(pinGhost.res.statusCode === 404 && pinGhost.json.code === "route-not-bound", "routes pin 未绑定路由 → 404");
+  // pin 空串 = 恢复自动跟随
+  const unpinned = await call(ctx, "/ark-quota/routes", "POST", "/ark-quota/routes",
+    { action: "pin", route: "" });
+  assert(unpinned.res.statusCode === 200 && unpinned.json.pinnedRoute === "", "routes pin 空串：恢复自动跟随");
+  // rename：改凭据组显示名（按路由定位）
+  const renamed = await call(ctx, "/ark-quota/routes", "POST", "/ark-quota/routes",
+    { action: "rename", route: "ark-coding-plan", label: "我的个人号" });
+  assert(renamed.res.statusCode === 200, "routes rename：200");
+  assert(renamed.json.routes.find((r) => r.route === "ark-coding-plan")?.accountLabel === "我的个人号", "routes rename：显示名更新");
+  // clear：清除配置（整组凭据作废；company 组仍在，路由视图里只剩它）
+  const clearedRes = await call(ctx, "/ark-quota/routes", "POST", "/ark-quota/routes",
+    { action: "clear", route: "ark-coding-plan" });
+  assert(clearedRes.res.statusCode === 200, "routes clear：200");
+  assert(!clearedRes.json.routes.some((r) => r.route === "ark-coding-plan"), "routes clear：路由从视图移除");
+  assert(!clearedRes.json.accounts.some((a) => a.id === "personal"), "routes clear：该火山账号凭据组整个删除");
+  // 被清组若正是固定目标，固定解除
+  const pinThenClear = await call(ctx, "/ark-quota/routes", "POST", "/ark-quota/routes",
+    { action: "pin", route: "ark-coding-plan-company" });
+  assert(pinThenClear.json.pinnedRoute === "ark-coding-plan-company", "先 pin 到 company 路由");
+  const clearPinned = await call(ctx, "/ark-quota/routes", "POST", "/ark-quota/routes",
+    { action: "clear", route: "ark-coding-plan-company" });
+  assert(clearPinned.json.pinnedRoute === "", "routes clear：固定目标被清后自动解除固定");
+  // clear 未绑定路由 → 404
+  const unGhost = await call(ctx, "/ark-quota/routes", "POST", "/ark-quota/routes",
+    { action: "clear", route: "never-bound" });
+  assert(unGhost.res.statusCode === 404 && unGhost.json.code === "route-not-bound", "routes clear 未绑定 → 404");
+  // 非法 action / GET
+  const badAction = await call(ctx, "/ark-quota/routes", "POST", "/ark-quota/routes", { action: "nope" });
+  assert(badAction.res.statusCode === 400 && badAction.json.code === "bad-action", "routes：非法 action → 400");
+  const getRes = await call(ctx, "/ark-quota/routes", "GET", "/ark-quota/routes");
+  assert(getRes.res.statusCode === 405, "routes：GET → 405");
+  assert(!JSON.stringify(clearPinned.json).includes("ak-company"), "routes：响应不泄露密钥");
+  // 旧 /ark-quota/accounts 路由已下线
+  assert(!ctx.__routes.has("/ark-quota/accounts"), "/ark-quota/accounts 已下线");
+}
+
+// --- routes 视图：routesSummary 以路由为单位、带显示名与配置状态 ---
+{
+  const ctx = mockCtx();
+  apply(ctx, multiConfig());
+  const status = await call(ctx, "/ark-quota/status", "GET", "/ark-quota/status");
+  assert(Array.isArray(status.json.routes) && status.json.routes.length === 2, "status 带出 2 个已绑定路由");
+  const cp = status.json.routes.find((r) => r.route === "ark-coding-plan");
+  assert(cp && cp.name === "火山 Coding Plan" && cp.configured === true && cp.accountId === "personal",
+    "routes 视图：id/显示名/配置状态/归属账号齐全");
 }
 
 // --- /ark-quota/stats 路由已移除（请求统计功能下线）---
@@ -720,9 +823,10 @@ assert(ALLOWED_REFRESH_MS.length === 5, "刷新档位共 5 个");
   const gone = await call(ctx, "/ark-quota/stats", "GET", "/ark-quota/stats");
   assert(gone.__missing === true, "调用 /ark-quota/stats 找不到 handler（功能已下线）");
   // 其余路由仍在
-  for (const p of ["/ark-quota", "/ark-quota/status", "/ark-quota/providers", "/ark-quota/credentials", "/ark-quota/accounts", "/ark-quota/settings"]) {
+  for (const p of ["/ark-quota", "/ark-quota/status", "/ark-quota/providers", "/ark-quota/credentials", "/ark-quota/routes", "/ark-quota/settings"]) {
     assert(ctx.__routes.has(p), `路由仍注册：${p}`);
   }
+  assert(!ctx.__routes.has("/ark-quota/accounts"), "/ark-quota/accounts 已下线");
 }
 
 // --- 快照域正常打开（域名合法、schema 不接受 null）---
@@ -763,20 +867,20 @@ assert(ALLOWED_REFRESH_MS.length === 5, "刷新档位共 5 个");
   const r1 = await call(ctx, "/ark-quota/settings", "POST", "/ark-quota/settings", { refreshMs: 60000 }, xsite);
   assert(r1.res.statusCode === 403 && r1.json.code === "cross-origin", "cross-site POST /settings → 403");
   const r2 = await call(ctx, "/ark-quota/credentials", "POST", "/ark-quota/credentials",
-    { account: "personal", accessKeyId: "a", secretAccessKey: "b" }, xsite);
+    { route: "ark-coding-plan", accessKeyId: "a", secretAccessKey: "b" }, xsite);
   assert(r2.res.statusCode === 403 && r2.json.code === "cross-origin", "cross-site POST /credentials → 403");
-  const r3 = await call(ctx, "/ark-quota/accounts", "POST", "/ark-quota/accounts",
-    { action: "activate", id: "personal" }, xsite);
-  assert(r3.res.statusCode === 403 && r3.json.code === "cross-origin", "cross-site POST /accounts → 403");
+  const r3 = await call(ctx, "/ark-quota/routes", "POST", "/ark-quota/routes",
+    { action: "pin", route: "ark-coding-plan" }, xsite);
+  assert(r3.res.statusCode === 403 && r3.json.code === "cross-origin", "cross-site POST /routes → 403");
   // 同源请求不受影响
   const okSettings = await call(ctx, "/ark-quota/settings", "POST", "/ark-quota/settings", { refreshMs: 60000 }, same);
   assert(okSettings.res.statusCode === 200, "same-origin POST /settings 正常 200");
-  const okActivate = await call(ctx, "/ark-quota/accounts", "POST", "/ark-quota/accounts",
-    { action: "activate", id: "personal" }, same);
-  assert(okActivate.res.statusCode === 200, "same-origin POST /accounts 正常 200");
-  // 被跨站拦掉的 activate 没有生效
+  const okPin = await call(ctx, "/ark-quota/routes", "POST", "/ark-quota/routes",
+    { action: "pin", route: "ark-coding-plan" }, same);
+  assert(okPin.res.statusCode === 200, "same-origin POST /routes 正常 200");
+  // 被跨站拦掉的 pin 没有生效（同源 pin 生效后 pinnedRoute 应为 ark-coding-plan）
   const status = await call(ctx, "/ark-quota/status", "GET", "/ark-quota/status");
-  assert(status.json.activeAccountId === "personal", "被 403 拦掉的写请求没有改动配置");
+  assert(status.json.pinnedRoute === "ark-coding-plan", "同源 pin 生效、跨站 pin 被拦");
 }
 
 // --- dropAccountSnaps：删账号清快照桶（纯函数）---
@@ -845,23 +949,29 @@ assert(ALLOWED_REFRESH_MS.length === 5, "刷新档位共 5 个");
   }
 }
 
-// --- 删账号：快照桶随账号一起落盘清除 ---
+// --- 解绑路由：空凭据组（无密钥）的快照桶随组一起落盘清除 ---
 {
   const orig = globalThis.fetch;
   globalThis.fetch = async () => ({ status: 200, async text() { return JSON.stringify(codingBody); } });
   try {
     const ctx = mockCtx();
-    apply(ctx, multiConfig());
-    // 先给 personal 拉一次额度（记快照），等落盘节流（STATS_FLUSH_MS=2s）写下去。
-    await call(ctx, "/ark-quota", "GET", "/ark-quota?account=personal");
-    await new Promise((r) => setTimeout(r, 2300));
-    const before = ctx.__stored();
-    assert(before?.snapsByAccount?.personal !== undefined, "删除前：personal 的快照桶已落盘");
-    // 删除账号，再等一个落盘周期。
-    await call(ctx, "/ark-quota/accounts", "POST", "/ark-quota/accounts", { action: "remove", id: "personal" });
+    // 一个「只绑了路由、没有密钥」的临时组：解绑后应被清掉。
+    apply(ctx, {
+      accounts: [
+        {
+          id: "r_temp_route", label: "", accessKeyId: "", secretAccessKey: "",
+          region: "cn-beijing", version: "2024-01-01", providers: ["temp-route"]
+        }
+      ],
+      activeAccountId: "r_temp_route",
+      refreshMs: 300000
+    });
+    // 无密钥空组：清除其唯一路由后整组应被清除。
+    const un = await call(ctx, "/ark-quota/routes", "POST", "/ark-quota/routes", { action: "clear", route: "temp-route" });
+    assert(un.res.statusCode === 200 && un.json.accounts.length === 0, "无密钥空组：清除配置后整组移除");
     await new Promise((r) => setTimeout(r, 2300));
     const after = ctx.__stored();
-    assert(after?.snapsByAccount?.personal === undefined, "删除后：personal 的快照桶已从落盘态清除");
+    assert(!after?.snapsByAccount || after.snapsByAccount["r_temp_route"] === undefined, "空组清除后不留快照桶");
   } finally {
     globalThis.fetch = orig;
   }

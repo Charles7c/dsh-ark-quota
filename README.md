@@ -16,12 +16,12 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) (DSH) web 
 
 - Sidebar footer widget: wide card (5-hour / weekly / monthly usage bars, shown as used %) on the footer action row, or a compact pill. **The pill's color and number follow the most urgent tier** (a red 5-hour tier stays visible with the sidebar collapsed); hover it for all three tiers. Hover any row for precise percentages, absolute counts (when returned by the API), and the exact wall-clock reset time. First load shows skeleton bars so the card never jumps in height.
 - **Pace signals**: for the weekly/monthly tiers the primary basis is quota progress vs time progress — the average burn since the period started (the same basis AWS Budgets / GCP Billing alerts use). It needs no snapshot history, works immediately after a reset, and cannot be thrown off by one heavy-usage day. The 5-hour tier is a **sliding window** judged by water-level dynamics instead (net rise = recent inflow − aging outflow); once capped it also reports "recovers ~HH:mm after usage stops". The rows stay clean — just label, recent rate, used % and reset countdown over one bar; status is carried by color, and hovering the rate chip shows a compact 2–3 line detail (recent vs budget rate, time/quota progress, projected run-out or recovery time). On the grey track, a **tinted forecast segment** shows the predicted end point (a lighter block in the same hue): for the weekly and 5-hour tiers it follows the recent momentum once ≥6 samples are in — a stopped account makes the segment stop extending — while the monthly tier and the warm-up period use the average-pace projection (extrapolating a 24 h observation over 30 days is not trustworthy, so monthly stays on the conservative cumulative basis). Recent burn comes from an **exponentially weighted** least-squares fit over in-window snapshots (newer points weigh more, so pace changes show up faster). Rate units match the decision horizon: **%/hour for the 5-hour tier** (budget 20%/h), **%/day for the weekly and monthly tiers** (budgets 14.3%/d and 3.3%/d, directly comparable across the two). Snapshots are persisted through `ctx.storageDomain`, so the observation history survives a restart.
-- **One-click account switch**: when the 5-hour/weekly tier is projected to run out within an hour (or is already capped) and multiple accounts are configured, a red "switch to ‹account›" button appears in the card header — the target is auto-picked by the most monthly headroom.
-- **Multiple accounts**: one AK/SK pair identifies one Volcengine account, so the plugin holds a list of them. A compact dropdown in the card header switches the shown account (stable for any number of accounts); the choice is persisted as the default. Display names support Chinese.
-- **Route attribution & misconfiguration hints**: each account can tick the `llm` provider routes that belong to it. The settings UI lists only routes whose endpoint points at Volcano Ark (`volces.com` / `volcengine.com`) by default, and explicitly warns when a linked route is NOT a Volcano endpoint (e.g. `deepseek-official` linked by mistake); expand "show all" to untick it.
-- Agent Plan fallback: when the account is not subscribed to Coding Plan, the proxy auto-detects `GetAFPUsage` and renders the absolute quota windows instead.
+- **Follows the selected model provider**: the card takes its identity from DSH's **llm provider route**. Switching the model in a session (composer seat or `/model` popup) makes the card follow to the bound Volcengine account's quota; switching sessions follows too. The dropdown offers "Auto-follow current model" (default) or pinning one provider; a pinned choice persists per route (`pinnedRoute`).
+- **One-click provider switch**: when the 5-hour/weekly tier is projected to run out within an hour (or is already capped) and multiple providers are bound, a red "switch to ‹provider›" button appears in the card header — the target is auto-picked by the most monthly headroom.
+- **Route-centric configuration**: the settings page's main dropdown is the model-provider route (the Ark providers configured in DSH's model settings); pick a route and save its AK/SK — **no account to create or name**. Routes auto-bind to a credential group on first save; the same AK/SK entered for multiple routes is recognized as one Volcengine account and merged; unbinding a route whose group has no keys left cleans the group up. Only routes pointing at Volcano Ark (`volces.com` / `volcengine.com`) are listed by default.
+- Agent Plan fallback: when the route's account is not subscribed to Coding Plan, the proxy auto-detects `GetAFPUsage` and renders the absolute quota windows instead.
 - Live maintenance: keys are read from the `ark-quota` settings namespace (`$DSH_HOME/settings.yaml`, hot-reloaded by `dsh-settings-file`). A change drops the cache immediately — **no server restart**.
-- Settings UI: a top-level **方舟额度** section in the DSH settings manages the account list — add/remove accounts, rename them (Chinese, saved on Enter/blur), tick the routes they cover, and save AK/SK with one click (write-only fields, hot-applied, with browser autofill suppression).
+- Settings UI: a top-level **方舟额度** section in the DSH settings — pick a model-provider route and paste AK/SK (write-only fields, hot-applied, with browser autofill suppression); bound routes can be unbound.
 
 ## Requirements
 
@@ -65,19 +65,19 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) (DSH) web 
          name: dsh-ark-quota
          config:
            accounts:
-             - id: personal              # /^[a-z][a-z0-9_]*$/ internal slug; label (below) is the free-form display name
-               label: 个人 Pro
+             - id: r_ark_coding_plan     # internal credential-group id (auto-generated when you save keys for a route in the UI)
                accessKeyId: ''           # optional here — fill it in the DSH Settings UI instead
                secretAccessKey: ''
                region: cn-beijing
                version: '2024-01-01'
-               providers: [ark-coding-plan]
-           activeAccountId: personal
+               providers: [ark-coding-plan]   # bound llm provider route id
            refreshMs: 300000
    ```
 
-   The single-account shape (top-level `accessKeyId` / `secretAccessKey`, no `accounts`)
-   still works and is migrated automatically into one account with id `default`.
+   You normally don't hand-write this: in **Settings → 方舟额度**, pick a model-provider
+   route and paste its AK/SK — the group and binding above are created automatically. The
+   legacy single-account shape (top-level `accessKeyId` / `secretAccessKey`) and the old
+   `activeAccountId` still work and are migrated; the new sidebar pin target is `pinnedRoute`.
 
 4. Apply and verify. Editing `cordis.patch.yml` is hot-applied by DSH's HMR watcher on recent
    versions (the host route and client boot graph recompose without a restart) — check it with
@@ -98,9 +98,9 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) (DSH) web 
 
 ## Usage
 
-- The widget adaptively polls `/ark-quota` at `refreshMs` (default 5 min; change it in Settings → 方舟额度 to 1/5/10/30 min or 1 hour), and immediately refreshes whenever the settings namespace changes. Only the account currently shown is polled; other accounts are loaded on demand (served from cache while fresh).
-- Click the **⟳** button (or `?force=1`) for an immediate refetch of the current account.
-- With two or more accounts a compact dropdown appears in the card header. Switching swaps the quota figures and pace verdict, and writes the choice back as the new default. When a short tier is about to run out, the urgent row also offers a one-click switch to the account with the most monthly headroom.
+- The widget adaptively polls `/ark-quota` at `refreshMs` (default 5 min; change it in Settings → 方舟额度 to 1/5/10/30 min or 1 hour), and immediately refreshes whenever the settings namespace changes. By default it **auto-follows the current session's model route**; pinning a provider in the dropdown (`pinnedRoute`) shows just that one. Bound routes are polled on demand and cached separately.
+- Click the **⟳** button (or `?force=1`) for an immediate refetch of the current route's account.
+- With two or more bound routes a compact dropdown appears in the card header: the first item is "Auto-follow current model", the rest are routes (the auto-mode current route is prefixed with ⛓). Pinning writes `pinnedRoute`; choosing auto clears it. When a short tier is about to run out, the header also offers a one-click switch to the route with the most monthly headroom.
 - Rows carry no verdict line: status is conveyed by the bar fill, forecast segment and rate-chip colors; hovering the rate chip shows the compact detail — for weekly/monthly, quota progress ÷ time progress (the average pace since the period started; available right after a reset, no snapshot history needed) and the projected run-out; for the 5-hour sliding-window tier, the aging rate, net rise and projected run-out/recovery time. Recent burn comes from an exponentially weighted OLS fit over in-window snapshots (30-min window for the 5-hour tier, 12 h for weekly, 24 h for monthly). Rates show as %/hour on the 5-hour tier and %/day on the weekly/monthly tiers.
 - When the keys are missing or wrong you'll see an error card; fix them in Settings → 方舟额度 (or re-run `node tools/check.mjs`) and the widget updates itself.
 
@@ -108,33 +108,33 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) (DSH) web 
 
 All settings live in the `ark-quota` settings namespace. The composition entry config in `cordis.patch.yml` is the **base**; the user layer in `$DSH_HOME/settings.yaml` overrides it and is hot-applied.
 
+**Configure via the settings UI by model-provider route** (no hand-written account id needed). The YAML layer still works; the fields below describe what the UI maintains:
+
 | key                | type   | default      | description                                       |
 | ------------------ | ------ | ------------ | ------------------------------------------------- |
-| `accounts`         | array  | `[]`         | Volcengine accounts (see below). Empty ⇒ the legacy top-level keys are migrated into one `default` account. |
-| `activeAccountId`  | string | `""`         | Which account the card shows; falls back to the first one. |
+| `accounts`         | array  | `[]`         | Credential groups (see below). Normally auto-created when you save AK/SK for a route; empty ⇒ legacy top-level keys migrate into one `default` group. |
+| `activeAccountId`  | string | `""`         | Which credential group the card shows when no route follow/pin applies; falls back to the first one. |
+| `pinnedRoute`      | string | `""`         | The `llm` provider route id pinned in the sidebar; empty = auto-follow the current session's model. |
 | `refreshMs`        | number | `300000`     | proxy cache TTL; one of `60000` / `300000` / `600000` / `1800000` / `3600000`. Other values snap to the nearest allowlisted cadence. |
-| `accessKeyId`      | string | `""` (secret)| **Legacy** single-account AccessKey ID; read only when `accounts` is empty. |
-| `secretAccessKey`  | string | `""` (secret)| **Legacy** single-account Secret Access Key.       |
-| `region`           | string | `cn-beijing` | Legacy default region.                             |
-| `version`          | string | `2024-01-01` | Legacy default control-plane OpenAPI version.      |
+| `accessKeyId` / `secretAccessKey` / `region` / `version` | — | — | **Legacy** single-account fields, read only when `accounts` is empty (migrated). |
 
-Each entry of `accounts`:
+Each entry of `accounts` (a credential group = one Volcengine account = one AK/SK pair):
 
 | key                | type     | default      | description                                     |
 | ------------------ | -------- | ------------ | ----------------------------------------------- |
-| `id`               | string   | —            | Internal slug matching `/^[a-z][a-z0-9_]*$/`; also the key under which this account's burn-rate snapshots are persisted. Invalid or duplicate ids are dropped. |
-| `label`            | string   | same as `id` | Display name shown in the card and settings; free-form, supports Chinese. |
-| `accessKeyId`      | string   | `""` (secret)| Volcengine AccessKey ID for this account.       |
-| `secretAccessKey`  | string   | `""` (secret)| Volcengine Secret Access Key for this account.  |
+| `id`               | string   | auto         | Internal slug matching `/^[a-z][a-z0-9_]*$/`; also the snapshot-bucket key. Auto-generated on first route bind (`r_` prefix + sanitized route id). Invalid/duplicate ids are dropped. |
+| `label`            | string   | empty        | Optional display name; when empty the UI shows the route name. |
+| `accessKeyId`      | string   | `""` (secret)| Volcengine AccessKey ID. Entering the same AK/SK pair for another route merges that route into this group. |
+| `secretAccessKey`  | string   | `""` (secret)| Volcengine Secret Access Key.                   |
 | `region`           | string   | `cn-beijing` | Ark region.                                     |
 | `version`          | string   | `2024-01-01` | control-plane OpenAPI version.                  |
-| `providers`        | string[] | `[]`         | `llm` provider route ids that belong to this account — used to mark ownership in the settings UI and to warn when a ticked route is not a Volcano endpoint. May be empty (quota only). |
+| `providers`        | string[] | `[]`         | The `llm` provider route ids bound to this group — the route→account ownership table, maintained automatically by saving credentials for a route. |
 
-> The settings UI lists only routes whose `baseURL` points at a Volcano Ark endpoint by default, and warns about linked routes that are not (e.g. `deepseek-official`); use "show all" (`?all=1`) to untick them. The internal `id` is limited to lowercase letters/digits/underscore, while the display `label` is free-form (Chinese included).
+> Identity is the provider route: the session's selected model routes to a credential group via this table. The settings UI lists only routes whose `baseURL` points at a Volcano Ark endpoint by default; non-Ark routes (e.g. `deepseek-official`) never appear. Unbinding a route whose group then has no routes and no keys removes the empty group.
 
 ## API
 
-`GET /ark-quota[?account=<id>][&force=1]` → same-origin JSON:
+`GET /ark-quota[?route=<providerId>|?account=<id>][&force=1]` → same-origin JSON:
 
 ```json
 {
@@ -145,29 +145,33 @@ Each entry of `accounts`:
   "cachedAt": 1786639101000,
   "refreshMs": 300000,
   "hasReward": false,
-  "accountId": "personal",
-  "accountLabel": "个人 Pro",
-  "accounts": [{ "id": "personal", "label": "个人 Pro", "configured": true, "providers": ["ark-coding-plan"] }],
-  "activeAccountId": "personal",
+  "accountId": "r_ark_coding_plan",
+  "accountLabel": "",
+  "accounts": [{ "id": "r_ark_coding_plan", "label": "", "configured": true, "providers": ["ark-coding-plan"] }],
+  "routes": [{ "route": "ark-coding-plan", "name": "火山Coding Plan", "accountId": "r_ark_coding_plan", "configured": true, "monthlyPct": 23 }],
+  "activeAccountId": "r_ark_coding_plan",
+  "pinnedRoute": "",
   "quota": [
     { "level": "monthly", "percentUsed": 90.18, "percentRemaining": 9.82, "cap": 100, "rewardTotalPercent": 0, "resetAt": 1786639101, "used": 90, "total": 100 }
   ]
 }
 ```
 
-`cachedAt` is milliseconds since epoch (the moment this payload entered the host cache). `updatedAt` / `resetAt` stay unix seconds as returned by the console API. Each account is cached separately.
+`route=` resolves a provider route to its credential group (used by sidebar follow/pin); `?account=` queries an internal group id (compat). `routes` is the route-dimension view (bound routes + display name + configured flag + monthly headroom) and `pinnedRoute` is the pinned route (empty = auto-follow). `cachedAt` is ms; `updatedAt` / `resetAt` are unix seconds. Each credential group is cached separately.
 
-On failure: `{ "ok": false, "code": "unauthorized" | "missing-auth" | "unknown-account" | "upstream" | "network", "message": "…", "accounts": [...] }` (HTTP 401 / 404 / 502 / 504). The account list rides along on failures too, so the switcher survives a bad key.
+On failure: `{ "ok": false, "code": "unauthorized" | "missing-auth" | "unknown-account" | "upstream" | "network", "message": "…", "accounts": [...], "routes": [...] }` (HTTP 401 / 404 / 502 / 504). The route list rides along on failures too, so the switcher survives a bad key.
 
-`GET /ark-quota/providers` → `{ ok, providers: [{ id, name }], claimed: { <providerId>: <accountId> }, foreignClaimed: [{ id, name, owner }], filtered, totalProviders }` — the routes registered with the `llm` service, plus which account already claims each. Only routes pointing at a Volcano Ark endpoint are returned by default; `foreignClaimed` lists linked routes that are NOT Volcano endpoints (misconfiguration hint); `?all=1` lists everything. Never carries credentials.
+`GET /ark-quota/providers` → `{ ok, providers: [{ id, name }], claimed: { <providerId>: <groupId> }, foreignClaimed: [...], filtered, totalProviders }` — the routes registered with the `llm` service plus which credential group claims each. Only Volcano-Ark-endpoint routes by default; `?all=1` lists everything. Never carries credentials.
 
-`POST /ark-quota/accounts` → `{ action: "add" | "remove" | "update" | "activate", id, label?, providers? }`. Returns the same payload as `/ark-quota/status`. Credentials go through `/ark-quota/credentials` (which accepts an optional `account` field) and are never echoed back.
+`POST /ark-quota/credentials` → `{ route?: <providerId>, account?: <id>, accessKeyId, secretAccessKey }`: saving keys **by route** (preferred) auto-creates the group on first bind and merges groups sharing the same AK/SK; `account` is the compat entry. Keys are never echoed back.
 
-> The `burn` field on a quota payload (per account, per tier) carries the pace signals. **Weekly/monthly — average pace (primary):** `paceRatio` (quota progress ÷ time progress — the average burn multiplier since the period started), `projectedAtReset` (projected used % at reset at the average pace, may exceed 100), `timeProgress` / `quotaProgress`. **Recent burn:** `perDay` (exponentially weighted OLS slope over in-window snapshots, in %/day; half-life = one third of the observation window), `budgetPerDay` (the even pace that would exactly hit 100% at reset), `ratio` (recent burn ÷ budget), `trendRatio` (recent ratio ÷ average ratio; >1 means speeding up), `recentProjected` (weekly tier only: projected used % at reset at the recent rate), `exhaustAt` (projected run-out time, ms — linear at the recent rate for weekly, at the net rise for the 5-hour tier), `sampleMs` / `samples` (observation span and sample count). **Authoritative forecast fields:** `forecast` (the bar segment end, in %) and `forecastBasis` (`recent` once ≥6 recent samples exist, else `average`; the monthly tier is always `average`). **5-hour sliding-window tier only:** `agingPerDay` (outflow rate of usage ageing out of the window, from pre-window snapshots; the client falls back to the budget rate when absent), `netPerDay` (net rise = recent inflow − aging), `recoverAt` (when capped, projected time for the level to fall back to 95% after usage stops, ms); this tier has no time-progress projection. `status` (`ok` / `warn` / `over`) follows the average-pace projection for the monthly tier (≥100% hits the wall, ≥85% tight); for the weekly tier it takes the worse of the average and recent projections, except that with ≥6 recent samples and a clear slowdown (recent rate under half the average) it downgrades to the recent basis when the recent projection does not hit the wall (a stopped account no longer alarms). The 5-hour tier follows the recent ratio, floored at `warn` when the net rise still hits the wall and raised to `over` when that happens within an hour; when the upstream gives no reset time or the period just started, it falls back to the recent-ratio basis. Account list entries also carry `monthlyPct` (the account's latest observed monthly used %, for the switch suggestion).
+`POST /ark-quota/routes` → `{ action: "pin" | "unbind" | "rename", route, label? }`: `pin` pins/unpins the sidebar target (`route: ""` = auto-follow), `unbind` detaches a route (the empty keyless group is removed), `rename` sets a group's display label. Returns the same payload as `/ark-quota/status`.
+
+> The `burn` field on a quota payload (per credential group, per tier; the route-view items also carry `monthlyPct`, the bound account's most recent monthly used % used for the one-click switch suggestion) carries the pace signals. **Weekly/monthly — average pace (primary):** `paceRatio` (quota progress ÷ time progress — the average burn multiplier since the period started), `projectedAtReset` (projected used % at reset at the average pace, may exceed 100), `timeProgress` / `quotaProgress`. **Recent burn:** `perDay` (exponentially weighted OLS slope over in-window snapshots, in %/day; half-life = one third of the observation window), `budgetPerDay` (the even pace that would exactly hit 100% at reset), `ratio` (recent burn ÷ budget), `trendRatio` (recent ratio ÷ average ratio; >1 means speeding up), `recentProjected` (weekly tier only: projected used % at reset at the recent rate), `exhaustAt` (projected run-out time, ms — linear at the recent rate for weekly, at the net rise for the 5-hour tier), `sampleMs` / `samples` (observation span and sample count). **Authoritative forecast fields:** `forecast` (the bar segment end, in %) and `forecastBasis` (`recent` once ≥6 recent samples exist, else `average`; the monthly tier is always `average`). **5-hour sliding-window tier only:** `agingPerDay` (outflow rate of usage ageing out of the window, from pre-window snapshots; the client falls back to the budget rate when absent), `netPerDay` (net rise = recent inflow − aging), `recoverAt` (when capped, projected time for the level to fall back to 95% after usage stops, ms); this tier has no time-progress projection. `status` (`ok` / `warn` / `over`) follows the average-pace projection for the monthly tier (≥100% hits the wall, ≥85% tight); for the weekly tier it takes the worse of the average and recent projections, except that with ≥6 recent samples and a clear slowdown (recent rate under half the average) it downgrades to the recent basis when the recent projection does not hit the wall (a stopped account no longer alarms). The 5-hour tier follows the recent ratio, floored at `warn` when the net rise still hits the wall and raised to `over` when that happens within an hour; when the upstream gives no reset time or the period just started, it falls back to the recent-ratio basis. Account list entries also carry `monthlyPct` (the account's latest observed monthly used %, for the switch suggestion).
 
 ## Security notes
 
-- The `/ark-quota`, `/ark-quota/status`, `/ark-quota/providers`, `/ark-quota/accounts`, `/ark-quota/credentials`, and `/ark-quota/settings` routes are **localhost-only** (bound to the DSH server) and are **unauthenticated**: any process on the same machine can read your quota figures, force an authenticated refresh, overwrite your access keys via `POST /ark-quota/credentials`, add/remove accounts via `POST /ark-quota/accounts`, or change the `refreshMs` polling cadence via `POST /ark-quota/settings` (the same exposure as directly editing `settings.yaml` on that machine). The three state-changing POST routes additionally enforce a **same-origin check**: cross-site form POSTs from other web pages you happen to visit while DSH is running are rejected (403) based on the `Sec-Fetch-Site` / `Origin` headers, while same-machine clients like curl are unaffected. They **never echo your access keys** (responses carry only booleans / quota numbers / account ids and labels); `/ark-quota/credentials` accepts only a fixed-shape `account` / `accessKeyId` / `secretAccessKey` triple of strings, `/ark-quota/accounts` only a fixed action plus an id, label, and provider-id list, and `/ark-quota/settings` only `refreshMs` from a fixed allowlist — no user-controlled URL, so they cannot be used as a proxy/SSRF vector or leak the Volcengine credentials. Don't expose the DSH server beyond loopback while this plugin is loaded.
+- The `/ark-quota`, `/ark-quota/status`, `/ark-quota/providers`, `/ark-quota/routes`, `/ark-quota/credentials`, and `/ark-quota/settings` routes are **localhost-only** (bound to the DSH server) and are **unauthenticated**: any process on the same machine can read your quota figures, force an authenticated refresh, overwrite your access keys via `POST /ark-quota/credentials`, pin/unbind routes via `POST /ark-quota/routes`, or change the `refreshMs` polling cadence via `POST /ark-quota/settings` (the same exposure as directly editing `settings.yaml` on that machine). The state-changing POST routes enforce a **same-origin check**: cross-site form POSTs from other web pages you happen to visit while DSH is running are rejected (403) based on the `Sec-Fetch-Site` / `Origin` headers, while same-machine clients like curl are unaffected. They **never echo your access keys** (responses carry only booleans / quota numbers / route and group ids); each POST accepts only a fixed shape of strings (`route` / `account` / `accessKeyId` / `secretAccessKey`, or `action` + `route` + `label`, or allowlisted `refreshMs`) — no user-controlled URL, so they cannot be used as a proxy/SSRF vector or leak the Volcengine credentials. Don't expose the DSH server beyond loopback while this plugin is loaded.
 - Access keys are real credentials. They are stored in `cordis.patch.yml` / `settings.yaml` under `$DSH_HOME`, declared with `role('secret')` in the settings schema (the DSH settings UI shows them as write-only fields and never sends their values back to the browser), and are **excluded from git** (see `.gitignore`).
 - `tools/check.mjs` only signs one request with the keys you pass on the command line / via `ARK_AK`/`ARK_SK`; it never writes them to disk and never prints them in full.
 

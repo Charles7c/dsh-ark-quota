@@ -113,13 +113,19 @@ function mk(level, arr) {
   assert(r.netPerDay !== null && r.netPerDay <= 0.05, "低速使用净增速 ≈ 0，实际 " + Math.round(r.netPerDay));
   assert(r.exhaustAt === null, "净增速 ≤ 0 → 无用完时刻（不会画到 88% 稳态）");
   // 猛烧场景：窗口前（60~30 分钟前）很闲 ≈8%/时，近期半小时烧到 40%
-  //（≈60%/时）→ 净增速为正、给用完时刻；外推 1 小时的水位远低于
-  // inflow/aging 的理论稳态（旧逻辑会画到 100% 贴边）。
+  //（≈60%/时）→ 净增速为正；但 1 小时后（重置/滚动）水位才到 ~92%、到不
+  // 了顶，因此耗尽时刻晚于重置，宿主应返回 exhaustAt=null（越过重置的外推
+  // 无意义——这正是「4h31m 后重置却算出更晚用完」的 bug 修正）。
   const hot = mk("session", [[60, 4], [50, 5], [40, 6], [30, 8], [20, 18], [10, 29], [0, 40]]);
   const rh = burnRate(hot, "session", 40, now, Math.floor((now + 3600000) / 1000));
-  assert(rh.netPerDay > 0 && rh.exhaustAt !== null, "猛烧且老化低 → 净增速为正、给用完时刻");
+  assert(rh.netPerDay > 0, "猛烧且老化低 → 净增速为正");
   const projected = 40 + rh.netPerDay / 24 * 1;
-  assert(projected < 100, "净增速外推 1 小时后的水位（" + Math.round(projected) + "%）远低于理论稳态");
+  assert(projected < 100, "净增速外推到重置时的水位（" + Math.round(projected) + "%）到不了顶");
+  assert(rh.exhaustAt === null, "重置前到不了顶 → exhaustAt 为 null（不把越过重置的时刻报成用完）");
+  // 反例：同样的速率但水位已 90%，重置前确实会撞线 → 给出耗尽时刻。
+  const rh2 = burnRate(hot, "session", 90, now, Math.floor((now + 3600000) / 1000));
+  assert(rh2.exhaustAt !== null && rh2.exhaustAt <= now + 3600000,
+    "高水位时重置前会撞线 → 给用完时刻且不晚于重置");
 }
 
 // ── 7. foldSnap 采样与 migrate 不回归 ───────────────────────────
